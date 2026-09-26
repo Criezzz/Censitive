@@ -1,5 +1,3 @@
-"""In-memory demo use cases: prepare, approve/send, cancel and session deletion."""
-
 import asyncio
 import json
 import secrets

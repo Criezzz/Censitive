@@ -1,5 +1,3 @@
-"""Local provider discovery and official CLI-owned sign-in; never accepts chat text."""
-
 import asyncio
 import subprocess
 import tempfile

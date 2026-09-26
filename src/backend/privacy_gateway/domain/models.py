@@ -1,5 +1,3 @@
-"""Versioned source spans and replacement data; no masking or token authorization yet."""
-
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -17,8 +15,6 @@ class SpanErrorCode(StrEnum):
 
 
 class SpanValidationError(ValueError):
-    """A fixed reason code; error messages never interpolate source text or IDs."""
-
     def __init__(self, code: SpanErrorCode) -> None:
         self.code = code
         super().__init__(code.value)
@@ -33,8 +29,6 @@ def _validate_source_identity(message_id: str, message_revision: int) -> None:
 
 @dataclass(frozen=True)
 class SourceSpan:
-    """Half-open Python code-point offsets tied to one message revision."""
-
     message_id: str
     message_revision: int
     start: int
@@ -55,11 +49,6 @@ def validate_span(
     message_id: str,
     message_revision: int,
 ) -> None:
-    """Check a span against the caller's current, unnormalized source snapshot.
-
-    The caller must pair text with its actual revision. This function cannot detect
-    edited text incorrectly presented with an unchanged revision.
-    """
     if not isinstance(span, SourceSpan):
         raise SpanValidationError(SpanErrorCode.INVALID_SPAN)
     if not isinstance(text, str):
@@ -75,8 +64,6 @@ def validate_span(
 
 @dataclass(frozen=True)
 class Replacement:
-    """A source span and proposed token; grammar/scope checks belong to later slices."""
-
     span: SourceSpan
     token: str
 

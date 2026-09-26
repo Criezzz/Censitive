@@ -1,5 +1,3 @@
-"""Loopback-only API with strict DTOs, owner cookies and CSRF checks."""
-
 import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable

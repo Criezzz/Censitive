@@ -1,5 +1,3 @@
-"""The only application-to-provider boundary: approved bytes in, plain text out."""
-
 from typing import Protocol
 
 

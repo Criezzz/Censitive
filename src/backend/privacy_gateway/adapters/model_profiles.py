@@ -1,5 +1,3 @@
-"""Pinned local model identities shared by setup, runtime, detector and UI metadata."""
-
 from dataclasses import dataclass
 from types import MappingProxyType
 

@@ -1,5 +1,3 @@
-"""Bounded, loopback-only inference. No proxy, redirect, cloud fallback, or transcript logs."""
-
 import asyncio
 import json
 import os

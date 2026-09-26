@@ -1,5 +1,3 @@
-"""Ground model proposals in immutable user-authored source text; policy stays in code."""
-
 from dataclasses import dataclass
 from typing import Literal
 

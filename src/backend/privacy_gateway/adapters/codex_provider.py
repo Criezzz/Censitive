@@ -1,10 +1,3 @@
-"""Opt-in, version-pinned Codex text responder using existing ChatGPT login.
-
-No conversation is passed through argv or loaded from the application workspace.
-The CLI receives the approved JSON on stdin and adds a fixed instruction envelope.
-This deliberately supports one verified CLI build; upgrades require conformance tests.
-"""
-
 import asyncio
 import hashlib
 import json

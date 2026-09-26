@@ -1,5 +1,3 @@
-"""Run one local process; memory state must not be split across workers."""
-
 import argparse
 
 import uvicorn

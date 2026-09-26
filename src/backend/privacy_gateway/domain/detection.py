@@ -1,5 +1,3 @@
-"""Small, explicit rule coverage for the local demonstration (not semantic detection)."""
-
 import re
 from dataclasses import dataclass
 

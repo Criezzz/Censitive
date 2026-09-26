@@ -1,5 +1,3 @@
-"""Deterministic span replacement and single-pass local restoration."""
-
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -11,7 +9,7 @@ TOKEN = re.compile(r"\[\[PG_v1_[0-9a-f]{32}\]\]")
 
 
 class PrivacyError(ValueError):
-    """Only fixed public error codes are emitted by the privacy pipeline."""
+    pass
 
 
 @dataclass(frozen=True)

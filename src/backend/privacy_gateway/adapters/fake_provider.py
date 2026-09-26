@@ -1,5 +1,3 @@
-"""A deterministic offline responder consuming only serialized provider-bound text."""
-
 import asyncio
 import json
 
