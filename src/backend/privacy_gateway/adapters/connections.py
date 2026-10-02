@@ -6,6 +6,7 @@ from pathlib import Path
 
 from privacy_gateway.adapters.codex_provider import CodexProvider
 from privacy_gateway.adapters.fake_provider import FakeProvider
+from privacy_gateway.adapters.local_chat import LocalChatProvider
 from privacy_gateway.adapters.provider import Provider
 from privacy_gateway.domain.redaction import PrivacyError
 
@@ -21,7 +22,11 @@ PUBLIC_CODES = {
 
 class ProviderConnections:
     def __init__(
-        self, default: Provider, codex_factory: Callable[[], CodexProvider] = CodexProvider
+        self,
+        default: Provider,
+        codex_factory: Callable[[], CodexProvider] = CodexProvider,
+        *,
+        local: LocalChatProvider | None = None,
     ) -> None:
         self.demo: Provider = default if default.provider_id == "local-demo" else FakeProvider()
         self.codex = default if isinstance(default, CodexProvider) else None
@@ -31,9 +36,10 @@ class ProviderConnections:
         self.lock = asyncio.Lock()
         self.login_task: asyncio.Task[None] | None = None
         self.login_owner = ""
+        self.local = local
 
     def catalog(self) -> list[dict[str, object]]:
-        return [
+        catalog: list[dict[str, object]] = [
             {
                 "id": "local-demo",
                 "name": "Demo local",
@@ -51,6 +57,19 @@ class ProviderConnections:
                 "code": self.code,
             },
         ]
+        if self.local is not None:
+            catalog.append(
+                {
+                    "id": self.local.provider_id,
+                    "name": "Qwen local",
+                    "model": self.local.model,
+                    "auth": "local-runtime",
+                    "status": "ready" if self.local.key else "unavailable",
+                    "code": "" if self.local.key else "LOCAL_CHAT_UNAVAILABLE",
+                    "streaming": True,
+                }
+            )
+        return catalog
 
     def _load(self) -> CodexProvider:
         if self.codex is None:
@@ -80,6 +99,14 @@ class ProviderConnections:
                 self.status, self.code = "ready", ""
 
     async def resolve(self, provider_id: str, model: str) -> Provider:
+        if (
+            self.local is not None
+            and provider_id == self.local.provider_id
+            and model == self.local.model
+        ):
+            if not self.local.key:
+                raise PrivacyError("LOCAL_CHAT_UNAVAILABLE")
+            return self.local
         if provider_id == "local-demo" and model == self.demo.model:
             return self.demo
         if provider_id != "codex-chatgpt" or model != CodexProvider.model:

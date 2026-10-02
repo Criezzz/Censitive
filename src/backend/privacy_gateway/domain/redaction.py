@@ -17,6 +17,7 @@ class Binding:
     token: str
     value: str
     restore_allowed: bool = True
+    scope: str = ""
 
 
 def apply_spans(

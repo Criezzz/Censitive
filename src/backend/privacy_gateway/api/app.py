@@ -1,24 +1,43 @@
+import asyncio
+import json
 import re
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
+from anyio import CancelScope
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.types import Receive, Scope, Send
 
 from privacy_gateway.adapters.connections import ProviderConnections
+from privacy_gateway.adapters.provider import StreamingProvider
 from privacy_gateway.application.gateway import Gateway
 from privacy_gateway.domain.models import SpanValidationError
 from privacy_gateway.domain.redaction import PrivacyError
+from privacy_gateway.domain.state import State
 
 
 class StrictInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class OwnedStreamingResponse(StreamingResponse):
+    def __init__(self, events: AsyncGenerator[bytes, None]) -> None:
+        self.events = events
+        super().__init__(events, media_type="application/x-ndjson")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with CancelScope(shield=True):
+                await self.events.aclose()
 
 
 class PrepareInput(StrictInput):
@@ -31,6 +50,40 @@ class PrepareInput(StrictInput):
 
 class SnapshotInput(StrictInput):
     prepared_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+
+
+class CorrectionInput(StrictInput):
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    fact_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    expected_revision: int = Field(ge=1)
+    expected_epoch: int = Field(ge=0)
+    text: str = Field(min_length=1, max_length=800)
+
+
+def state_view(state: State, enabled: bool) -> dict[str, object]:
+    return {
+        "enabled": enabled,
+        "epoch": state.epoch,
+        "facts": [
+            {
+                "id": fact.id,
+                "revision": fact.revision,
+                "value": state.quote(fact.assertion),
+                "category": fact.category,
+                "scope": fact.scope,
+                "superseded": fact.superseded,
+                "source_id": fact.assertion.message_id,
+                "source_revision": fact.assertion.message_revision,
+                "start": fact.assertion.start,
+                "end": fact.assertion.end,
+            }
+            for fact in state.facts
+        ],
+        "sources": [
+            {"id": source.id, "revision": source.revision, "text": source.text}
+            for source in state.sources
+        ],
+    }
 
 
 class ProviderInput(StrictInput):
@@ -153,8 +206,13 @@ def create_app(
                 "csrf": clients[value],
                 "provider": service.provider.provider_id,
                 "model": service.provider.model,
-                "mode": "rules-manual-semantic" if service.detector else "rules-and-manual",
-                "detector": service.detector.model if service.detector else "rules",
+                "mode": "semantic-state"
+                if service.resolver
+                else ("rules-manual-semantic" if service.detector else "rules-and-manual"),
+                "detector": service.resolver.model
+                if service.resolver
+                else (service.detector.model if service.detector else "rules"),
+                "state_enabled": service.resolver is not None,
             }
         )
         response.set_cookie("censitive_owner", value, httponly=True, samesite="strict", path="/")
@@ -222,7 +280,23 @@ def create_app(
             "terms": session.terms,
             "busy": session.busy,
             "audit": session.audit,
+            "state": state_view(session.state, service.resolver is not None),
         }
+
+    @app.post("/api/sessions/{session_id}/facts/correct")
+    async def correct_fact(
+        session_id: str, data: CorrectionInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        service.correct_fact(
+            session,
+            data.fact_id,
+            data.expected_revision,
+            data.expected_epoch,
+            data.text,
+            data.operation_id,
+        )
+        return state_view(session.state, True)
 
     @app.post("/api/sessions/{session_id}/prepare")
     async def prepare(session_id: str, data: PrepareInput, request: Request) -> dict[str, object]:
@@ -246,6 +320,19 @@ def create_app(
                 for d in prepared.detections
             ],
             "history_count": len(session.provider_history),
+            "streaming": isinstance(session.provider, StreamingProvider),
+            "state": state_view(prepared.staged_state, True)
+            if prepared.staged_state is not None
+            else None,
+            "work": None
+            if prepared.compilation is None
+            else {
+                "recomputed_sources": prepared.compilation.recomputed,
+                "reused_sources": prepared.compilation.reused,
+                "compilation_full_fallback": prepared.compilation.full_fallback,
+                "model_calls": prepared.resolver_calls,
+                "resolver_full_fallback": prepared.resolver_full_fallback,
+            },
             "semantic": None
             if prepared.semantic is None
             else {
@@ -278,6 +365,64 @@ def create_app(
         session = service.session(session_id, owner(request))
         result = await service.send(session, data.prepared_id)
         return {"content": result, "provider": session.provider.provider_id}
+
+    @app.post("/api/sessions/{session_id}/send-stream")
+    async def send_stream(
+        session_id: str, data: SnapshotInput, request: Request
+    ) -> StreamingResponse:
+        session = service.session(session_id, owner(request))
+        if not isinstance(session.provider, StreamingProvider):
+            raise PrivacyError("STREAM_UNSUPPORTED")
+        provider_id = session.provider.provider_id
+
+        async def events() -> AsyncGenerator[bytes, None]:
+            queue: asyncio.Queue[str] = asyncio.Queue(maxsize=16)
+
+            async def observe(text: str) -> None:
+                try:
+                    await asyncio.wait_for(queue.put(text), timeout=5)
+                except TimeoutError:
+                    raise PrivacyError("STREAM_BACKPRESSURE") from None
+
+            def record(kind: str, **fields: str) -> bytes:
+                return (
+                    json.dumps(
+                        {"type": kind, "prepared_id": data.prepared_id, **fields},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+
+            worker = asyncio.create_task(service.send(session, data.prepared_id, on_delta=observe))
+            pending: asyncio.Task[str] | None = None
+            try:
+                while not worker.done() or not queue.empty():
+                    pending = asyncio.create_task(queue.get())
+                    done, _ = await asyncio.wait(
+                        {worker, pending}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if pending in done:
+                        yield record("delta", text=pending.result())
+                    else:
+                        pending.cancel()
+                        await asyncio.gather(pending, return_exceptions=True)
+                    pending = None
+                content = await worker
+                yield record("complete", content=content, provider=provider_id)
+            except PrivacyError as error:
+                yield record("error", code=str(error))
+            finally:
+                with CancelScope(shield=True):
+                    if pending is not None:
+                        pending.cancel()
+                        await asyncio.gather(pending, return_exceptions=True)
+                    if not worker.done():
+                        service.cancel(session, data.prepared_id)
+                        worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
+
+        return OwnedStreamingResponse(events())
 
     @app.post("/api/sessions/{session_id}/discard")
     async def discard(session_id: str, data: SnapshotInput, request: Request) -> dict[str, bool]:

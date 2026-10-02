@@ -22,6 +22,24 @@ class Detection:
     restore_allowed: bool
 
 
+def credential_detections(text: str) -> tuple[Detection, ...]:
+    result: dict[tuple[int, int], Detection] = {}
+    for match in DEMO_SECRET.finditer(text):
+        result[(match.start(), match.end())] = Detection(
+            match.start(), match.end(), "demo_secret", False
+        )
+        if len(result) > 512:
+            raise PrivacyError("DETECTION_LIMIT")
+    for match in LABELED_SECRET.finditer(text):
+        value = match[1].rstrip(".")
+        if value:
+            start, end = match.start(1), match.start(1) + len(value)
+            result[(start, end)] = Detection(start, end, "credential", False)
+            if len(result) > 512:
+                raise PrivacyError("DETECTION_LIMIT")
+    return tuple(result.values())
+
+
 def detect(
     text: str,
     terms: tuple[str, ...],
@@ -48,10 +66,7 @@ def detect(
             candidates[(start, end)] = Detection(start, end, category, False)
 
     for base, segment in segments:
-        for pattern, category, restore in (
-            (EMAIL, "email", True),
-            (DEMO_SECRET, "demo_secret", False),
-        ):
+        for pattern, category, restore in ((EMAIL, "email", True),):
             for match in pattern.finditer(segment):
                 add(base + match.start(), base + match.end(), category, restore)
         for term in terms:
@@ -61,10 +76,8 @@ def detect(
             while (start := segment.find(term, offset)) >= 0:
                 add(base + start, base + start + len(term), "manual", True)
                 offset = start + 1
-        for match in LABELED_SECRET.finditer(segment):
-            value = match[1].rstrip(".")
-            if value:
-                add(base + match.start(1), base + match.start(1) + len(value), "credential", False)
+        for item in credential_detections(segment):
+            add(base + item.start, base + item.end, item.category, False)
         for protection in protections:
             offset = 0
             while (start := segment.find(protection.quote, offset)) >= 0:

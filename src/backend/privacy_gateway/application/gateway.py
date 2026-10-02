@@ -1,15 +1,21 @@
+from __future__ import annotations
+
 import asyncio
+import hashlib
 import json
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_detector import SemanticDetector
-from privacy_gateway.adapters.provider import Provider
-from privacy_gateway.domain.detection import Detection, detect
+from privacy_gateway.adapters.provider import Provider, StreamingProvider, serialize_request
+from privacy_gateway.domain.detection import Detection, credential_detections, detect
+from privacy_gateway.domain.incremental import Compilation, CompiledSource, compile_state
 from privacy_gateway.domain.models import Replacement, SourceSpan
 from privacy_gateway.domain.redaction import (
     PREFIX,
@@ -22,6 +28,12 @@ from privacy_gateway.domain.redaction import (
     validate_tokens,
 )
 from privacy_gateway.domain.semantic import Protection, SemanticReport
+from privacy_gateway.domain.serialization import strict_json
+from privacy_gateway.domain.state import State, unique_span
+from privacy_gateway.domain.streaming import IncrementalRestorer
+
+if TYPE_CHECKING:
+    from privacy_gateway.adapters.state_resolver import Resolution, StateResolver
 
 MAX_MESSAGES = 40
 MAX_BODY = 200_000
@@ -32,6 +44,7 @@ class Message:
     role: str
     content: str
     provider: str = ""
+    source_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,6 +61,13 @@ class Prepared:
     provider_signature: tuple[str, str, str]
     semantic: SemanticReport | None = None
     request_id: str = ""
+    staged_state: State | None = None
+    source_id: str = ""
+    literal_policies: tuple[str, ...] = ()
+    compilation: Compilation | None = None
+    expected_messages: tuple[Message, ...] = ()
+    resolver_calls: int = 0
+    resolver_full_fallback: bool = False
 
 
 @dataclass
@@ -68,6 +88,10 @@ class Session:
     cancelled: bool = False
     closed: bool = False
     audit: list[dict[str, str | int]] = field(default_factory=list)
+    state: State = field(default_factory=State)
+    compiled_sources: tuple[CompiledSource, ...] = ()
+    literal_policies: tuple[str, ...] = ()
+    corrections: dict[str, str] = field(default_factory=dict)
 
     @property
     def busy(self) -> bool:
@@ -80,11 +104,16 @@ class Session:
 
 class Gateway:
     def __init__(
-        self, provider: Provider | None = None, detector: SemanticDetector | None = None
+        self,
+        provider: Provider | None = None,
+        detector: SemanticDetector | None = None,
+        *,
+        resolver: StateResolver | None = None,
     ) -> None:
         self.sessions: dict[str, Session] = {}
         self.provider = provider or FakeProvider()
         self.detector = detector
+        self.resolver = resolver
 
     def create_session(self, owner: str) -> Session:
         if len(self.sessions) >= 100:
@@ -135,9 +164,23 @@ class Gateway:
         denied = {b.value for b in vault.values() if not b.restore_allowed}
         denied.update(p.quote for p in protections if not p.restore_allowed)
         denied.update(text[d.start : d.end] for d in detections if not d.restore_allowed)
+        segments = TOKEN.split(text) if history else (text,)
+        denied.update(
+            segment[item.start : item.end]
+            for segment in segments
+            for item in credential_detections(segment)
+        )
         for token, old in tuple(vault.items()):
             if any(value in old.value for value in denied) and old.restore_allowed:
-                vault[token] = Binding(token, old.value, False)
+                vault[token] = Binding(token, old.value, False, old.scope)
+        known_values = {binding.value for binding in vault.values()}
+        for value in sorted(denied - known_values):
+            if len(vault) >= 1024:
+                raise PrivacyError("VAULT_LIMIT")
+            token = f"[[PG_v1_{secrets.token_hex(16)}]]"
+            while token in vault:
+                token = f"[[PG_v1_{secrets.token_hex(16)}]]"
+            vault[token] = Binding(token, value, False)
         index = {(binding.value, binding.restore_allowed): binding for binding in vault.values()}
         replacements = []
         effective_detections = []
@@ -195,7 +238,7 @@ class Gateway:
         terms: tuple[str, ...],
         request_id: str | None = None,
     ) -> Prepared:
-        if self.detector is None:
+        if self.detector is None and self.resolver is None:
             return self.prepare(session, text, terms)
         if request_id in session.cancelled_prepares:
             raise PrivacyError("CANCELLED")
@@ -206,9 +249,18 @@ class Gateway:
         session.preparing_id = attempt
         sources = tuple(m.content for m in session.private_history if m.role == "user") + (text,)
         session.record("semantic", "started")
+        resolution: Resolution | None = None
         try:
-            protected = tuple(dict.fromkeys((*terms, *(b.value for b in session.vault.values()))))
-            report = await self.detector.analyze(sources, protected)
+            if self.resolver is not None:
+                literals = tuple(dict.fromkeys((*session.literal_policies, *terms)))
+                resolution = await self.resolver.resolve(session.state, text, literals)
+                report = resolution.report
+            else:
+                assert self.detector is not None
+                protected = tuple(
+                    dict.fromkeys((*terms, *(b.value for b in session.vault.values())))
+                )
+                report = await self.detector.analyze(sources, protected)
         except PrivacyError as error:
             if not session.closed:
                 session.record("semantic", str(error))
@@ -225,7 +277,147 @@ class Gateway:
         if attempt in session.cancelled_prepares:
             raise PrivacyError("CANCELLED")
         self.validate_input(session, text, terms)
+        if resolution is not None:
+            return self.prepare_stateful(session, text, terms, resolution, attempt)
         return self.prepare(session, text, terms, report=report, request_id=attempt)
+
+    def correct_fact(
+        self,
+        session: Session,
+        fact_id: str,
+        revision: int,
+        epoch: int,
+        text: str,
+        operation_id: str | None = None,
+    ) -> None:
+        if self.resolver is None:
+            raise PrivacyError("STATE_DISABLED")
+        signature = hashlib.sha256(repr((fact_id, revision, epoch, text)).encode()).hexdigest()
+        if operation_id is not None and operation_id in session.corrections:
+            if session.corrections[operation_id] != signature:
+                raise PrivacyError("STATE_COMMAND_CONFLICT")
+            return
+        if len(session.corrections) >= 128:
+            raise PrivacyError("STATE_COMMAND_LIMIT")
+        self.discard(session)
+        if session.state.epoch != epoch or type(epoch) is not int:
+            raise PrivacyError("STATE_STALE")
+        state, source = session.state.add_source(text)
+        state = state.correct(fact_id, revision, state.epoch, unique_span(source, text))
+        state.validate()
+        session.state = state
+        if operation_id is not None:
+            session.corrections[operation_id] = signature
+        session.record("fact_corrected", "committed_locally")
+
+    def prepare_stateful(
+        self,
+        session: Session,
+        text: str,
+        terms: tuple[str, ...],
+        resolution: Resolution,
+        request_id: str,
+    ) -> Prepared:
+        self.discard(session)
+        self.validate_input(session, text, terms)
+        state = resolution.delta.apply(session.state)
+        if state != resolution.staged_state:
+            raise PrivacyError("STATE_STALE")
+        state.validate()
+        current = resolution.current_source
+        if current.text != text or state.source(current.id) != current:
+            raise PrivacyError("STATE_SOURCE_MISMATCH")
+        if not (
+            set(session.state.sources) <= set(state.sources)
+            and set(session.state.facts) <= set(state.facts)
+            and set(session.state.entities) <= set(state.entities)
+            and set(session.state.links) <= set(state.links)
+            and set(session.state.rule_denials) <= set(state.rule_denials)
+        ):
+            raise PrivacyError("STATE_OBLIGATION_REMOVED")
+        literals = tuple(dict.fromkeys((*session.literal_policies, *terms)))
+        staged = session.vault.copy()
+        local_view = {token: Binding(token, b.value, True) for token, b in staged.items()}
+        assistant_views = {
+            index: restore_text(message.content, local_view, max_bytes=MAX_BODY)
+            for index, message in enumerate(session.provider_history)
+            if message.role == "assistant"
+        }
+        state = state.protect_credentials(tuple(assistant_views.values()))
+        for token, binding in tuple(staged.items()):
+            if binding.restore_allowed and any(
+                value in binding.value for value in state.denied_literals
+            ):
+                staged[token] = Binding(token, binding.value, False, binding.scope)
+        compilation = compile_state(
+            state,
+            literals,
+            staged,
+            session.compiled_sources,
+            resolver_signature=resolution.report.model + ":scoped-v1",
+        )
+        compiled = {item.stamp.source_id: item for item in compilation.sources}
+        messages: list[Message] = []
+        assistant_terms = tuple(
+            dict.fromkeys((*literals, *(state.quote(f.assertion) for f in state.facts)))
+        )
+        for index, message in enumerate(session.provider_history):
+            if message.role == "user":
+                if message.source_id not in compiled:
+                    raise PrivacyError("STATE_SOURCE_MISSING")
+                content = compiled[message.source_id].text
+            else:
+                local = assistant_views[index]
+                protections = tuple(
+                    Protection(secret, "credential", 0, 0, secret)
+                    for secret in state.denied_literals
+                )
+                content, _ = self._sanitize(
+                    local,
+                    assistant_terms,
+                    staged,
+                    history=True,
+                    protections=protections,
+                    semantic=True,
+                )
+            messages.append(Message(message.role, content, source_id=message.source_id))
+        last = compiled[current.id]
+        messages.append(Message("user", last.text, source_id=current.id))
+        body = serialize_request(
+            session.provider, [{"role": m.role, "content": m.content} for m in messages]
+        )
+        if len(body) > MAX_BODY:
+            raise PrivacyError("HISTORY_LIMIT")
+        allowed = set().union(*(tokens_in(m.content) for m in messages))
+        prepared = Prepared(
+            secrets.token_hex(16),
+            session.version,
+            body,
+            text,
+            last.text,
+            last.detections,
+            MappingProxyType({token: staged[token] for token in allowed}),
+            MappingProxyType(staged.copy()),
+            time.monotonic() + 300,
+            (
+                session.provider.provider_id,
+                session.provider.model,
+                session.provider.serializer_version,
+            ),
+            resolution.report,
+            request_id,
+            state,
+            current.id,
+            literals,
+            compilation,
+            tuple(messages),
+            resolution.model_calls,
+            resolution.full_fallback,
+        )
+        session.terms = terms
+        session.prepared = prepared
+        session.record("prepare", "ready")
+        return prepared
 
     def cancel_prepare(self, session: Session, request_id: str) -> None:
         if len(session.cancelled_prepares) >= 128 and request_id not in session.cancelled_prepares:
@@ -279,14 +471,9 @@ class Gateway:
             text, terms, staged, history=False, protections=protections, semantic=report is not None
         )
         messages.append(Message("user", sanitized))
-        body = json.dumps(
-            {
-                "model": session.provider.model,
-                "messages": [{"role": m.role, "content": m.content} for m in messages],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        body = serialize_request(
+            session.provider, [{"role": m.role, "content": m.content} for m in messages]
+        )
         if len(body) > MAX_BODY:
             raise PrivacyError("HISTORY_LIMIT")
         allowed = set().union(*(tokens_in(m.content) for m in messages))
@@ -324,20 +511,39 @@ class Gateway:
             raise PrivacyError("STALE_PREVIEW")
         if len(prepared.body) > MAX_BODY:
             raise PrivacyError("INVALID_PAYLOAD")
-        try:
-            payload = json.loads(prepared.body)
-        except (ValueError, UnicodeError):
-            raise PrivacyError("INVALID_PAYLOAD") from None
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != {"model", "messages"}
-            or payload["model"] != session.provider.model
-        ):
+        payload = strict_json(prepared.body)
+        if not isinstance(payload, dict) or payload.get("model") != session.provider.model:
             raise PrivacyError("INVALID_PAYLOAD")
-        if not isinstance(payload["messages"], list) or not payload["messages"]:
+        if not isinstance(payload.get("messages"), list) or not payload["messages"]:
             raise PrivacyError("INVALID_PAYLOAD")
+        expected_payload = json.loads(serialize_request(session.provider, payload["messages"]))
+        if json.dumps(payload, sort_keys=True) != json.dumps(expected_payload, sort_keys=True):
+            raise PrivacyError("INVALID_PAYLOAD")
+        scoped = prepared.staged_state is not None
+        expected: tuple[Message, ...] = ()
+        if prepared.staged_state is not None:
+            state = prepared.staged_state
+            state.validate()
+            reference = compile_state(
+                state,
+                prepared.literal_policies,
+                dict(prepared.staged_vault),
+                resolver_signature="gate-full-reference",
+                full=True,
+            )
+            compiled = {item.stamp.source_id: item.text for item in reference.sources}
+            expected = tuple(
+                Message(
+                    m.role,
+                    compiled[m.source_id] if m.role == "user" else m.content,
+                    source_id=m.source_id,
+                )
+                for m in prepared.expected_messages
+            )
+            if payload["messages"] != [{"role": m.role, "content": m.content} for m in expected]:
+                raise PrivacyError("OUTBOUND_BLOCKED")
         messages = []
-        for message in payload["messages"]:
+        for index, message in enumerate(payload["messages"]):
             if (
                 not isinstance(message, dict)
                 or set(message) != {"role", "content"}
@@ -348,19 +554,31 @@ class Gateway:
                 raise PrivacyError("INVALID_PAYLOAD")
             content = message["content"]
             validate_tokens(content, prepared.manifest)
-            if detect(content, session.terms, history=True):
+            literal_terms = prepared.literal_policies if scoped else session.terms
+            if detect(content, literal_terms, history=True):
                 raise PrivacyError("OUTBOUND_BLOCKED")
             segments = TOKEN.split(content)
-            if any(
-                binding.value in segment
-                for binding in prepared.staged_vault.values()
-                for segment in segments
-            ):
+            forbidden = (
+                prepared.staged_state.denied_literals
+                if prepared.staged_state is not None
+                else tuple(binding.value for binding in prepared.staged_vault.values())
+            )
+            if any(value in segment for value in forbidden for segment in segments):
                 raise PrivacyError("OUTBOUND_BLOCKED")
-            messages.append(Message(message["role"], content))
+            messages.append(
+                Message(
+                    message["role"], content, source_id=expected[index].source_id if scoped else ""
+                )
+            )
         return messages
 
-    async def send(self, session: Session, prepared_id: str) -> str:
+    async def send(
+        self,
+        session: Session,
+        prepared_id: str,
+        *,
+        on_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
         if session.busy:
             raise PrivacyError("SESSION_BUSY")
         prepared = session.prepared
@@ -368,14 +586,34 @@ class Gateway:
             prepared.id.encode(), prepared_id.encode()
         ):
             raise PrivacyError("STALE_PREVIEW")
+        if on_delta is not None and not isinstance(session.provider, StreamingProvider):
+            raise PrivacyError("STREAM_UNSUPPORTED")
         session.prepared = None
         messages = self.gate(prepared, session)
         session.active_id = prepared.id
         session.cancelled = False
         provider = session.provider
         session.record("dispatch", provider.provider_id)
+
+        async def consume() -> str:
+            if not isinstance(provider, StreamingProvider):
+                return await provider.complete(prepared.body)
+            restorer = IncrementalRestorer(prepared.manifest)
+            parts: list[str] = []
+            async with aclosing(provider.stream(prepared.body)) as stream:
+                async for delta in stream:
+                    safe = restorer.feed(delta)
+                    parts.append(delta)
+                    if on_delta is not None:
+                        for offset in range(0, len(safe), 4096):
+                            await on_delta(safe[offset : offset + 4096])
+                tail = restorer.finish()
+                if tail and on_delta is not None:
+                    await on_delta(tail)
+            return "".join(parts)
+
         try:
-            session.active_task = asyncio.create_task(provider.complete(prepared.body))
+            session.active_task = asyncio.create_task(consume())
             source = await asyncio.wait_for(session.active_task, timeout=provider.timeout)
             if session.cancelled or session.closed:
                 raise PrivacyError("CANCELLED")
@@ -383,9 +621,14 @@ class Gateway:
                 raise PrivacyError("RESPONSE_LIMIT")
             display = restore_text(source, prepared.manifest, max_bytes=MAX_BODY)
             session.vault = dict(prepared.staged_vault)
+            if prepared.staged_state is not None:
+                session.state = prepared.staged_state
+                session.literal_policies = prepared.literal_policies
+                assert prepared.compilation is not None
+                session.compiled_sources = prepared.compilation.sources
             session.provider_history = messages + [Message("assistant", source)]
             session.private_history += [
-                Message("user", prepared.original),
+                Message("user", prepared.original, source_id=prepared.source_id),
                 Message("assistant", display, provider.provider_id),
             ]
             session.version += 1
@@ -425,6 +668,10 @@ class Gateway:
         session.private_history.clear()
         session.provider_history.clear()
         session.vault.clear()
+        session.state = State()
+        session.compiled_sources = ()
+        session.literal_policies = ()
+        session.corrections.clear()
         session.terms = ()
         session.audit.clear()
         self.sessions.pop(session.id, None)

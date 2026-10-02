@@ -65,9 +65,11 @@ class SemanticDetector(Protocol):
 
 
 class LocalDetector:
-    def __init__(self, profile: str = "8b", *, key: str | None = None) -> None:
+    def __init__(
+        self, profile: str = "8b", *, key: str | None = None, lock: asyncio.Lock | None = None
+    ) -> None:
         self.model = model_profile(profile).model_id
-        self.lock = asyncio.Lock()
+        self.lock = lock if lock is not None else asyncio.Lock()
         self.key = os.environ.get("CENSITIVE_LOCAL_KEY", "") if key is None else key
 
     async def analyze(
@@ -113,47 +115,52 @@ class LocalDetector:
                     },
                 },
             }
-            try:
-                async with (
-                    asyncio.timeout(180),
-                    httpx.AsyncClient(
-                        base_url=ENDPOINT,
-                        trust_env=False,
-                        follow_redirects=False,
-                        timeout=180,
-                        headers={"Authorization": f"Bearer {self.key}"},
-                    ) as client,
-                ):
-                    async with client.stream(
-                        "POST", "/v1/chat/completions", json=payload
-                    ) as response:
-                        if response.status_code != 200:
-                            raise PrivacyError("SEMANTIC_UNAVAILABLE")
-                        data = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            data.extend(chunk)
-                            if len(data) > 64_000:
-                                raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
-                result = json.loads(data)
-                if not isinstance(result, dict):
-                    raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
-                if result.get("model") != self.model:
-                    raise PrivacyError("SEMANTIC_MODEL_MISMATCH")
-                choice = result["choices"][0]
-                if choice["finish_reason"] != "stop":
-                    raise PrivacyError("SEMANTIC_INCOMPLETE")
-                raw = choice["message"]["content"]
-                if not isinstance(raw, str):
-                    raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
-                findings = ground_proposals(raw, sources)
-            except (httpx.TimeoutException, TimeoutError):
-                raise PrivacyError("SEMANTIC_TIMEOUT") from None
-            except httpx.HTTPError:
-                raise PrivacyError("SEMANTIC_UNAVAILABLE") from None
-            except (KeyError, IndexError, TypeError, ValueError) as error:
-                if isinstance(error, PrivacyError):
-                    raise
-                raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
+            raw = await complete_local_json(payload, model=self.model, key=self.key)
+            findings = ground_proposals(raw, sources)
             return SemanticReport(
                 findings, self.model, int((time.monotonic() - started) * 1000), len(sources)
             )
+
+
+async def complete_local_json(payload: object, *, model: str, key: str) -> str:
+    if not key:
+        raise PrivacyError("SEMANTIC_UNAVAILABLE")
+    try:
+        async with (
+            asyncio.timeout(180),
+            httpx.AsyncClient(
+                base_url=ENDPOINT,
+                trust_env=False,
+                follow_redirects=False,
+                timeout=180,
+                headers={"Authorization": f"Bearer {key}"},
+            ) as client,
+        ):
+            async with client.stream("POST", "/v1/chat/completions", json=payload) as response:
+                if response.status_code != 200:
+                    raise PrivacyError("SEMANTIC_UNAVAILABLE")
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > 64_000:
+                        raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
+        result = json.loads(data)
+        if not isinstance(result, dict):
+            raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
+        if result.get("model") != model:
+            raise PrivacyError("SEMANTIC_MODEL_MISMATCH")
+        choice = result["choices"][0]
+        if choice["finish_reason"] != "stop":
+            raise PrivacyError("SEMANTIC_INCOMPLETE")
+        raw = choice["message"]["content"]
+        if not isinstance(raw, str):
+            raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
+        return raw
+    except (httpx.TimeoutException, TimeoutError):
+        raise PrivacyError("SEMANTIC_TIMEOUT") from None
+    except httpx.HTTPError:
+        raise PrivacyError("SEMANTIC_UNAVAILABLE") from None
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        if isinstance(error, PrivacyError):
+            raise
+        raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
