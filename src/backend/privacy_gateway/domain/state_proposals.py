@@ -40,6 +40,10 @@ class StateProposals(StrictProposal):
     links: list[FactLinkProposal] = Field(max_length=64)
 
 
+class DirectFactProposals(StateProposals):
+    links: list[FactLinkProposal] = Field(max_length=0)
+
+
 class ReferenceMention(StrictProposal):
     mention: QuoteRef
     relation: Literal["reference", "paraphrase"]
@@ -207,6 +211,15 @@ def ground_state_proposals(raw: str, state: State) -> GroundedProposals:
             raise
         links.append(link)
     return GroundedProposals(tuple(facts), tuple(dict.fromkeys(links)))
+
+
+def ground_direct_facts(raw: str, state: State) -> GroundedProposals:
+    state.validate()
+    try:
+        DirectFactProposals.model_validate_json(raw)
+    except (ValidationError, ValueError):
+        raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
+    return ground_state_proposals(raw, state)
 
 
 def stage_proposals(state: State, proposal: GroundedProposals) -> State:

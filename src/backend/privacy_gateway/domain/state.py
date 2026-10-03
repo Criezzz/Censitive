@@ -222,8 +222,17 @@ class State:
             if link.evidence != fact.assertion:
                 raise PrivacyError("STATE_EVIDENCE_MISMATCH")
         if any(
-            old.mention == link.mention
-            and (old.target, old.target_revision) != (link.target, link.target_revision)
+            (old.target, old.target_revision) != (link.target, link.target_revision)
+            and (
+                old.mention == link.mention
+                or (
+                    (old.relation == "alias" or link.relation == "alias")
+                    and old.mention.message_id == link.mention.message_id
+                    and old.mention.message_revision == link.mention.message_revision
+                    and old.mention.start < link.mention.end
+                    and link.mention.start < old.mention.end
+                )
+            )
             for old in self.links
         ):
             raise PrivacyError("STATE_AMBIGUOUS_LINK")

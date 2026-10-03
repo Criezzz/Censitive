@@ -18,6 +18,7 @@ from starlette.types import Receive, Scope, Send
 from privacy_gateway.adapters.connections import ProviderConnections
 from privacy_gateway.adapters.provider import StreamingProvider
 from privacy_gateway.application.gateway import Gateway
+from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand
 from privacy_gateway.domain.models import SpanValidationError
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.state import State
@@ -46,6 +47,7 @@ class PrepareInput(StrictInput):
         default_factory=list, max_length=30
     )
     request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    draft_identity: DraftIdentity | None = None
 
 
 class SnapshotInput(StrictInput):
@@ -58,6 +60,11 @@ class CorrectionInput(StrictInput):
     expected_revision: int = Field(ge=1)
     expected_epoch: int = Field(ge=0)
     text: str = Field(min_length=1, max_length=800)
+
+
+class IdentityInput(StrictInput):
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    command: IdentityCommand
 
 
 def state_view(state: State, enabled: bool) -> dict[str, object]:
@@ -80,8 +87,29 @@ def state_view(state: State, enabled: bool) -> dict[str, object]:
             for fact in state.facts
         ],
         "sources": [
-            {"id": source.id, "revision": source.revision, "text": source.text}
+            {
+                "id": source.id,
+                "revision": source.revision,
+                "text": source.text,
+                "digest": source.digest,
+            }
             for source in state.sources
+        ],
+        "entities": [
+            {
+                "id": entity.id,
+                "value": state.quote(entity.evidence),
+                "source_id": entity.evidence.message_id,
+                "protected": any(
+                    f.entity_id == entity.id and f.scope == "entity" for f in state.facts
+                ),
+                "aliases": [
+                    {"value": state.quote(link.mention), "source_id": link.mention.message_id}
+                    for link in state.links
+                    if link.relation == "alias" and link.target == entity.id
+                ],
+            }
+            for entity in state.entities
         ],
     }
 
@@ -184,7 +212,15 @@ def create_app(
         return JSONResponse({"code": error.code.value}, status_code=422)
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
+    async def validation_error(request: Request, _: RequestValidationError) -> JSONResponse:
+        command_path = re.fullmatch(
+            r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/correct)", request.url.path
+        )
+        if request.method == "POST" and command_path:
+            try:
+                service.discard(service.session(command_path[1], owner(request)))
+            except PrivacyError as error:
+                return JSONResponse({"code": str(error)}, status_code=409)
         return JSONResponse({"code": "INVALID_INPUT"}, status_code=422)
 
     def owner(request: Request) -> str:
@@ -283,6 +319,22 @@ def create_app(
             "state": state_view(session.state, service.resolver is not None),
         }
 
+    @app.post("/api/sessions/{session_id}/identity")
+    async def identity_command(
+        session_id: str, data: IdentityInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        receipt = service.identity_command(session, data.command, data.operation_id)
+        return {
+            "receipt": {
+                "operation_id": data.operation_id,
+                "committed_epoch": receipt.committed_epoch,
+                "entity_id": receipt.entity_id,
+                "policy_fact_id": receipt.policy_fact_id,
+            },
+            "state": state_view(session.state, True),
+        }
+
     @app.post("/api/sessions/{session_id}/facts/correct")
     async def correct_fact(
         session_id: str, data: CorrectionInput, request: Request
@@ -302,7 +354,11 @@ def create_app(
     async def prepare(session_id: str, data: PrepareInput, request: Request) -> dict[str, object]:
         session = service.session(session_id, owner(request))
         prepared = await service.prepare_message(
-            session, data.text, tuple(data.terms), data.request_id
+            session,
+            data.text,
+            tuple(data.terms),
+            data.request_id,
+            draft_identity=data.draft_identity,
         )
         return {
             "id": prepared.id,

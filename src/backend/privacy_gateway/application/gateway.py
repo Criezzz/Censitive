@@ -15,6 +15,7 @@ from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_detector import SemanticDetector
 from privacy_gateway.adapters.provider import Provider, StreamingProvider, serialize_request
 from privacy_gateway.domain.detection import Detection, credential_detections, detect
+from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand, apply_identity
 from privacy_gateway.domain.incremental import Compilation, CompiledSource, compile_state
 from privacy_gateway.domain.models import Replacement, SourceSpan
 from privacy_gateway.domain.redaction import (
@@ -70,6 +71,14 @@ class Prepared:
     resolver_full_fallback: bool = False
 
 
+@dataclass(frozen=True)
+class CommandReceipt:
+    signature: str
+    committed_epoch: int
+    entity_id: str = ""
+    policy_fact_id: str | None = None
+
+
 @dataclass
 class Session:
     id: str
@@ -91,7 +100,7 @@ class Session:
     state: State = field(default_factory=State)
     compiled_sources: tuple[CompiledSource, ...] = ()
     literal_policies: tuple[str, ...] = ()
-    corrections: dict[str, str] = field(default_factory=dict)
+    commands: dict[str, CommandReceipt] = field(default_factory=dict)
 
     @property
     def busy(self) -> bool:
@@ -237,7 +246,12 @@ class Gateway:
         text: str,
         terms: tuple[str, ...],
         request_id: str | None = None,
+        *,
+        draft_identity: DraftIdentity | None = None,
     ) -> Prepared:
+        if draft_identity is not None and self.resolver is None:
+            self.discard(session)
+            raise PrivacyError("STATE_DISABLED")
         if self.detector is None and self.resolver is None:
             return self.prepare(session, text, terms)
         if request_id in session.cancelled_prepares:
@@ -253,7 +267,12 @@ class Gateway:
         try:
             if self.resolver is not None:
                 literals = tuple(dict.fromkeys((*session.literal_policies, *terms)))
-                resolution = await self.resolver.resolve(session.state, text, literals)
+                if draft_identity is None:
+                    resolution = await self.resolver.resolve(session.state, text, literals)
+                else:
+                    resolution = await self.resolver.resolve(
+                        session.state, text, literals, draft_identity=draft_identity
+                    )
                 report = resolution.report
             else:
                 assert self.detector is not None
@@ -292,12 +311,16 @@ class Gateway:
     ) -> None:
         if self.resolver is None:
             raise PrivacyError("STATE_DISABLED")
-        signature = hashlib.sha256(repr((fact_id, revision, epoch, text)).encode()).hexdigest()
-        if operation_id is not None and operation_id in session.corrections:
-            if session.corrections[operation_id] != signature:
+        signature = hashlib.sha256(
+            repr(("correct", fact_id, revision, epoch, text)).encode()
+        ).hexdigest()
+        if operation_id is not None and operation_id in session.commands:
+            if session.commands[operation_id].signature != signature:
+                self.discard(session)
                 raise PrivacyError("STATE_COMMAND_CONFLICT")
             return
-        if len(session.corrections) >= 128:
+        if len(session.commands) >= 128:
+            self.discard(session)
             raise PrivacyError("STATE_COMMAND_LIMIT")
         self.discard(session)
         if session.state.epoch != epoch or type(epoch) is not int:
@@ -307,8 +330,34 @@ class Gateway:
         state.validate()
         session.state = state
         if operation_id is not None:
-            session.corrections[operation_id] = signature
+            session.commands[operation_id] = CommandReceipt(signature, state.epoch)
         session.record("fact_corrected", "committed_locally")
+
+    def identity_command(
+        self, session: Session, command: IdentityCommand, operation_id: str
+    ) -> CommandReceipt:
+        if self.resolver is None:
+            raise PrivacyError("STATE_DISABLED")
+        signature = hashlib.sha256(command.model_dump_json().encode("utf-8")).hexdigest()
+        previous = session.commands.get(operation_id)
+        if previous is not None:
+            if previous.signature != signature:
+                self.discard(session)
+                raise PrivacyError("STATE_COMMAND_CONFLICT")
+            return previous
+        if len(session.commands) >= 128:
+            self.discard(session)
+            raise PrivacyError("STATE_COMMAND_LIMIT")
+        self.discard(session)
+        result = apply_identity(session.state, command)
+        result.state.validate()
+        receipt = CommandReceipt(
+            signature, result.state.epoch, result.entity_id, result.policy_fact_id
+        )
+        session.state = result.state
+        session.commands[operation_id] = receipt
+        session.record("identity_" + command.kind, "committed_locally")
+        return receipt
 
     def prepare_stateful(
         self,
@@ -671,7 +720,7 @@ class Gateway:
         session.state = State()
         session.compiled_sources = ()
         session.literal_policies = ()
-        session.corrections.clear()
+        session.commands.clear()
         session.terms = ()
         session.audit.clear()
         self.sessions.pop(session.id, None)
