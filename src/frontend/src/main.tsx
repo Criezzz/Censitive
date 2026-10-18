@@ -3,6 +3,15 @@ import { createRoot } from "react-dom/client";
 import { ProvidersDialog } from "./ProvidersDialog";
 import { readStream } from "./stream";
 import {
+  IdentityPanel,
+  identityErrors,
+  selectedOccurrence,
+  type DraftAction,
+  type DraftOccurrence,
+  type IdentityCommand,
+  type IdentityResult,
+} from "./IdentityPanel";
+import {
   FactPanel,
   correctionErrors,
   type Correction,
@@ -92,6 +101,14 @@ const errors: Record<string, string> = {
     "Mã thao tác đã được dùng cho một thay đổi khác. Kiểm tra trạng thái trước khi sửa tiếp.",
   STATE_IDENTITY_REVIEW_REQUIRED:
     "Thay đổi danh tính cần xác định lại đúng người và phạm vi. Chưa áp dụng sửa đổi này.",
+  STATE_EVIDENCE_MISMATCH:
+    "Đoạn đã chọn không còn khớp nguồn. Hãy chọn lại đúng lần xuất hiện.",
+  STATE_ENTITY_MISSING:
+    "Định danh đã chọn không còn trong phiên. Hãy tải lại trạng thái và chọn lại.",
+  STATE_AMBIGUOUS_LINK:
+    "Các lựa chọn chồng lên nhau nhưng chỉ tới những định danh khác nhau. Hãy bỏ lựa chọn nháp rồi chọn lại.",
+  STATE_IDENTITY_NOT_APPLIED:
+    "Bản chuẩn bị chưa giữ đầy đủ lựa chọn bảo vệ danh tính. Chưa gửi; hãy chuẩn bị lại.",
   SEMANTIC_MODEL_MISMATCH:
     "Runtime đang trả lời bằng model khác cấu hình. Hãy khởi động lại đúng profile trước khi chuẩn bị bản gửi.",
   SEMANTIC_UNAVAILABLE:
@@ -208,6 +225,12 @@ function App() {
   const [session, setSession] = useState("");
   const [factState, setFactState] = useState<FactState | null>(null);
   const [factsConfirmed, setFactsConfirmed] = useState(true);
+  const [identityConfirmed, setIdentityConfirmed] = useState(true);
+  const identityOperation = useRef<string | null>(null);
+  const [draftActions, setDraftActions] = useState<DraftAction[]>([]);
+  const [draftSelection, setDraftSelection] = useState<DraftOccurrence | null>(
+    null,
+  );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [provisional, setProvisional] = useState<string | null>(null);
   const activeStream = useRef<AbortController | null>(null);
@@ -263,6 +286,7 @@ function App() {
         epoch: 0,
         facts: [],
         sources: [],
+        entities: [],
       });
       setFactsConfirmed(true);
       setProviderConfirmed(true);
@@ -279,8 +303,17 @@ function App() {
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, phase, provisional]);
+  useEffect(() => {
+    setDraftActions([]);
+    setDraftSelection(null);
+  }, [factState?.epoch, session, provider]);
 
-  function invalidate() {
+  function clearDraftIdentity() {
+    setDraftActions([]);
+    setDraftSelection(null);
+  }
+  function invalidate(clearIdentity = true) {
+    if (clearIdentity) clearDraftIdentity();
     generation.current++;
     if (preview && session)
       void api(`/sessions/${session}/discard`, "POST", {
@@ -291,7 +324,8 @@ function App() {
     if (phase !== "sending" && phase !== "loading") setPhase("idle");
   }
   async function selectProvider(nextProvider: string, nextModel: string) {
-    if (busy) throw new Error("SESSION_BUSY");
+    if (busy || !identityConfirmed) throw new Error("SESSION_BUSY");
+    clearDraftIdentity();
     setPhase("loading");
     generation.current++;
     setPreview(null);
@@ -329,7 +363,8 @@ function App() {
       !session ||
       busy ||
       !providerConfirmed ||
-      !factsConfirmed
+      !factsConfirmed ||
+      !identityConfirmed
     )
       return;
     const attempt = ++generation.current;
@@ -338,16 +373,35 @@ function App() {
     setPreview(null);
     setPhase("preparing");
     try {
+      const text = draft;
+      const actions = draftActions;
+      const epoch = factState?.epoch;
+      let draftIdentity;
+      if (actions.length) {
+        const bytes = await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(text),
+        );
+        if (attempt !== generation.current) return;
+        draftIdentity = {
+          expected_epoch: epoch,
+          text_digest: Array.from(new Uint8Array(bytes), (byte) =>
+            byte.toString(16).padStart(2, "0"),
+          ).join(""),
+          actions,
+        };
+      }
       const result = await api<Preview>(
         `/sessions/${session}/prepare`,
         "POST",
         {
-          text: draft,
+          text,
           request_id: preparingId.current,
           terms: terms
             .split("\n")
             .map((t) => t.trim())
             .filter(Boolean),
+          ...(draftIdentity ? { draft_identity: draftIdentity } : {}),
         },
       );
       if (attempt !== generation.current) return;
@@ -365,7 +419,8 @@ function App() {
     await streamCancellation.current?.catch(() => {});
   }
   async function send() {
-    if (!preview || phase !== "ready" || !factsConfirmed) return;
+    if (!preview || phase !== "ready" || !factsConfirmed || !identityConfirmed)
+      return;
     const streaming = preview.streaming === true;
     const controller = streaming ? new AbortController() : null;
     activeStream.current = controller;
@@ -428,10 +483,12 @@ function App() {
       setPreview(null);
       setPhase("idle");
       setCancelPending(false);
+      clearDraftIdentity();
       input.current?.focus();
     }
   }
   async function cancel() {
+    clearDraftIdentity();
     setCancelPending(true);
     const controller = activeStream.current;
     if (controller) {
@@ -455,7 +512,9 @@ function App() {
     }
   }
   async function correctFact(command: Correction) {
-    if (busy || !session) throw new Error("SESSION_BUSY");
+    if (busy || !session || !identityConfirmed || !providerConfirmed)
+      throw new Error("SESSION_BUSY");
+    clearDraftIdentity();
     generation.current++;
     setPhase("loading");
     setPreview(null);
@@ -484,13 +543,91 @@ function App() {
       setPhase("idle");
     }
   }
+  async function changeIdentity(command: IdentityCommand) {
+    if (busy || !session || !factsConfirmed || !providerConfirmed)
+      throw new Error("SESSION_BUSY");
+    if (
+      identityOperation.current &&
+      identityOperation.current !== command.operation_id
+    )
+      throw new Error("IDENTITY_OUTCOME_UNKNOWN");
+    if (!identityOperation.current) {
+      identityOperation.current = command.operation_id;
+      generation.current++;
+      setPreview(null);
+      clearDraftIdentity();
+    }
+    setIdentityConfirmed(false);
+    setPhase("loading");
+    setError("");
+    try {
+      const result = await api<IdentityResult>(
+        `/sessions/${session}/identity`,
+        "POST",
+        command,
+      );
+      if (
+        result.receipt?.operation_id !== command.operation_id ||
+        !result.state?.enabled ||
+        !Array.isArray(result.state.entities) ||
+        !Number.isInteger(result.receipt.committed_epoch) ||
+        result.state.epoch < result.receipt.committed_epoch
+      )
+        throw new Error("IDENTITY_OUTCOME_UNKNOWN");
+      setFactState(result.state);
+      setIdentityConfirmed(true);
+      identityOperation.current = null;
+    } catch (reason) {
+      explain(reason);
+      if (reason instanceof Error && identityErrors.has(reason.message)) {
+        try {
+          await refresh(session);
+          setIdentityConfirmed(true);
+          identityOperation.current = null;
+        } catch {
+          throw new Error("IDENTITY_OUTCOME_UNKNOWN");
+        }
+      }
+      throw reason;
+    } finally {
+      setPhase("idle");
+    }
+  }
+  function stageIdentity(action: DraftAction) {
+    if (
+      busy ||
+      !identityConfirmed ||
+      !factsConfirmed ||
+      !providerConfirmed ||
+      !factState?.enabled ||
+      !Array.isArray(factState.entities) ||
+      draftActions.length >= 16
+    )
+      return;
+    if (
+      Array.from(draft)
+        .slice(action.occurrence.start, action.occurrence.end)
+        .join("") !== action.occurrence.quote
+    )
+      return;
+    if (
+      action.kind === "alias" &&
+      !factState.entities.some((entity) => entity.id === action.entity_id)
+    )
+      return;
+    invalidate(false);
+    setDraftActions((current) =>
+      current.length < 16 ? [...current, action] : current,
+    );
+  }
   async function cancelPrepare() {
+    clearDraftIdentity();
+    generation.current++;
     setCancelPending(true);
     try {
       await api(`/sessions/${session}/cancel-prepare`, "POST", {
         prepared_id: preparingId.current,
       });
-      generation.current++;
       setPreview(null);
       setPhase("idle");
       setError(
@@ -503,7 +640,8 @@ function App() {
     }
   }
   async function reset() {
-    if (busy) return;
+    if (busy || !identityConfirmed) return;
+    clearDraftIdentity();
     setPhase("loading");
     setError("");
     generation.current++;
@@ -542,6 +680,7 @@ function App() {
         epoch: 0,
         facts: [],
         sources: [],
+        entities: [],
       });
       setFactsConfirmed(true);
       setPreview(null);
@@ -589,7 +728,7 @@ function App() {
         <button
           className="new-session"
           onClick={() => void reset()}
-          disabled={busy}
+          disabled={busy || !identityConfirmed}
         >
           <span>＋</span> Phiên mới
         </button>
@@ -636,7 +775,7 @@ function App() {
             className="demo-badge provider-trigger"
             ref={providerButton}
             onClick={() => setShowProviders(true)}
-            disabled={busy}
+            disabled={busy || !identityConfirmed}
             aria-label="Provider & kết nối"
           >
             <span />{" "}
@@ -812,6 +951,15 @@ function App() {
                   name="message"
                   autoComplete="off"
                   aria-label="Nội dung hội thoại"
+                  onSelect={(event) =>
+                    setDraftSelection(
+                      selectedOccurrence(
+                        draft,
+                        event.currentTarget.selectionStart,
+                        event.currentTarget.selectionEnd,
+                      ),
+                    )
+                  }
                   value={draft}
                   maxLength={20000}
                   disabled={busy}
@@ -858,7 +1006,8 @@ function App() {
                         !draft.trim() ||
                         busy ||
                         !providerConfirmed ||
-                        !factsConfirmed
+                        !factsConfirmed ||
+                        !identityConfirmed
                       }
                       onClick={() => void prepare()}
                     >
@@ -1075,7 +1224,9 @@ function App() {
                 <button
                   className="approve-btn"
                   onClick={() => void send()}
-                  disabled={phase !== "ready" || !factsConfirmed}
+                  disabled={
+                    phase !== "ready" || !factsConfirmed || !identityConfirmed
+                  }
                 >
                   <Shield small /> Duyệt & gửi bản này <span>→</span>
                 </button>
@@ -1094,9 +1245,20 @@ function App() {
             <FactPanel
               key={session}
               state={factState}
-              busy={busy}
+              busy={busy || !identityConfirmed || !providerConfirmed}
               uncertain={!factsConfirmed}
               onCorrect={correctFact}
+            />
+            <IdentityPanel
+              key={`identity:${session}`}
+              state={factState}
+              busy={busy || !factsConfirmed || !providerConfirmed}
+              uncertain={!identityConfirmed}
+              draftSelection={draftSelection}
+              actions={draftActions}
+              onCommand={changeIdentity}
+              onStage={stageIdentity}
+              onClearDraft={() => invalidate()}
             />
             <div className="scope-note">
               <span>i</span>

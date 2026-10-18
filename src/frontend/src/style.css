@@ -1610,6 +1610,99 @@ h2,
 h3 {
   text-wrap: balance;
 }
+.identity-panel {
+  margin: 12px 20px;
+  padding: 14px;
+  border: 1px solid #d9e4e7;
+  border-radius: 12px;
+  background: #f8fbfb;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.identity-panel > summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+.identity-panel p {
+  line-height: 1.6;
+  color: #526581;
+}
+.identity-panel label {
+  display: block;
+  margin-top: 12px;
+}
+.identity-panel select,
+.identity-panel textarea {
+  width: 100%;
+  max-width: 100%;
+  margin-top: 8px;
+  padding: 9px;
+  border: 1px solid #c9d8dd;
+  border-radius: 8px;
+  background: white;
+  font: inherit;
+}
+.identity-panel textarea {
+  min-height: 100px;
+  resize: vertical;
+  line-height: 1.6;
+}
+.identity-panel button {
+  padding: 8px 10px;
+  margin: 8px 4px 0 0;
+  border: 1px solid #c9d8dd;
+  border-radius: 8px;
+  background: white;
+  font: inherit;
+  line-height: 1.5;
+}
+.identity-panel fieldset {
+  min-width: 0;
+  margin: 16px 0 0;
+  padding: 10px;
+  border: 1px solid #d9e4e7;
+  border-radius: 8px;
+}
+.identity-panel legend {
+  font-weight: 650;
+}
+.identity-panel .identity-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.identity-detail {
+  margin-top: 12px;
+}
+.identity-detail > strong,
+.identity-detail > span {
+  display: block;
+  margin-top: 4px;
+}
+.identity-context {
+  margin: 10px 0;
+  padding-left: 10px;
+  border-left: 3px solid #9bc5cb;
+  white-space: pre-wrap;
+  line-height: 1.7;
+}
+.identity-context small {
+  display: block;
+  color: #526581;
+}
+.identity-context mark {
+  background: #d5edc7;
+  color: #173440;
+  padding: 1px 2px;
+}
+.identity-draft-actions {
+  padding-left: 20px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.identity-draft-actions li {
+  margin: 6px 0;
+}
 @media (max-width: 700px) {
   .semantic-example {
     padding: 16px;

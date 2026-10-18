@@ -100,11 +100,20 @@ def state_view(state: State, enabled: bool) -> dict[str, object]:
                 "id": entity.id,
                 "value": state.quote(entity.evidence),
                 "source_id": entity.evidence.message_id,
+                "source_revision": entity.evidence.message_revision,
+                "start": entity.evidence.start,
+                "end": entity.evidence.end,
                 "protected": any(
                     f.entity_id == entity.id and f.scope == "entity" for f in state.facts
                 ),
                 "aliases": [
-                    {"value": state.quote(link.mention), "source_id": link.mention.message_id}
+                    {
+                        "value": state.quote(link.mention),
+                        "source_id": link.mention.message_id,
+                        "source_revision": link.mention.message_revision,
+                        "start": link.mention.start,
+                        "end": link.mention.end,
+                    }
                     for link in state.links
                     if link.relation == "alias" and link.target == entity.id
                 ],
@@ -166,6 +175,18 @@ def create_app(
                     service.discard(service.session(prepare_path[1], owner))
                 except PrivacyError as error:
                     return JSONResponse({"code": str(error)}, status_code=409)
+            command_path = re.fullmatch(
+                r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/correct)", request.url.path
+            )
+
+            def reject_body(code: str, status: int) -> JSONResponse:
+                if request.method == "POST" and command_path:
+                    try:
+                        service.discard(service.session(command_path[1], owner))
+                    except PrivacyError as error:
+                        return JSONResponse({"code": str(error)}, status_code=409)
+                return JSONResponse({"code": code}, status_code=status)
+
             length = request.headers.get("content-length", "")
             if (
                 not length.isascii()
@@ -173,16 +194,16 @@ def create_app(
                 or len(length) > 6
                 or int(length) > 100_000
             ):
-                return JSONResponse({"code": "INPUT_TOO_LARGE"}, status_code=413)
+                return reject_body("INPUT_TOO_LARGE", 413)
             if request.method == "POST" and not request.headers.get("content-type", "").startswith(
                 "application/json"
             ):
-                return JSONResponse({"code": "TEXT_JSON_ONLY"}, status_code=415)
+                return reject_body("TEXT_JSON_ONLY", 415)
             received = bytearray()
             async for chunk in request.stream():
                 received.extend(chunk)
                 if len(received) > 100_000:
-                    return JSONResponse({"code": "INPUT_TOO_LARGE"}, status_code=413)
+                    return reject_body("INPUT_TOO_LARGE", 413)
             request._body = bytes(received)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"

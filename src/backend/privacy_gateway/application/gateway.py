@@ -15,7 +15,12 @@ from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_detector import SemanticDetector
 from privacy_gateway.adapters.provider import Provider, StreamingProvider, serialize_request
 from privacy_gateway.domain.detection import Detection, credential_detections, detect
-from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand, apply_identity
+from privacy_gateway.domain.identity import (
+    DraftIdentity,
+    IdentityCommand,
+    apply_identity,
+    verify_draft_identity,
+)
 from privacy_gateway.domain.incremental import Compilation, CompiledSource, compile_state
 from privacy_gateway.domain.models import Replacement, SourceSpan
 from privacy_gateway.domain.redaction import (
@@ -297,6 +302,13 @@ class Gateway:
             raise PrivacyError("CANCELLED")
         self.validate_input(session, text, terms)
         if resolution is not None:
+            if draft_identity is not None:
+                verify_draft_identity(
+                    session.state,
+                    resolution.staged_state,
+                    resolution.current_source,
+                    draft_identity,
+                )
             return self.prepare_stateful(session, text, terms, resolution, attempt)
         return self.prepare(session, text, terms, report=report, request_id=attempt)
 

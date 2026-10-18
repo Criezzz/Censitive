@@ -12,7 +12,23 @@ export type FactState = {
     superseded: boolean;
     source_id: string;
   }[];
-  sources: { id: string; revision: number; text: string }[];
+  sources: { id: string; revision: number; text: string; digest?: string }[];
+  entities?: {
+    id: string;
+    value: string;
+    source_id: string;
+    source_revision?: number;
+    start?: number;
+    end?: number;
+    protected: boolean;
+    aliases: {
+      value: string;
+      source_id: string;
+      source_revision?: number;
+      start?: number;
+      end?: number;
+    }[];
+  }[];
 };
 export type Correction = {
   operation_id: string;

@@ -9,6 +9,7 @@ import httpx
 from privacy_gateway.adapters.model_profiles import model_profile
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.semantic import Proposals, SemanticReport, ground_proposals
+from privacy_gateway.domain.serialization import strict_json
 
 ENDPOINT = "http://127.0.0.1:8011"
 CONTEXT_CHARS = 6000
@@ -144,7 +145,7 @@ async def complete_local_json(payload: object, *, model: str, key: str) -> str:
                     data.extend(chunk)
                     if len(data) > 64_000:
                         raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
-        result = json.loads(data)
+        result = strict_json(bytes(data), code="SEMANTIC_INVALID_OUTPUT")
         if not isinstance(result, dict):
             raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
         if result.get("model") != model:

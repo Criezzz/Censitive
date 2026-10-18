@@ -180,3 +180,23 @@ def apply_draft_identity(
             state = state.add_link(Link(span, entity.id, 1, "alias", entity.evidence))
     state.validate()
     return state
+
+
+def verify_draft_identity(
+    base: State, staged: State, current: Source, draft: DraftIdentity
+) -> None:
+    staged.validate()
+    source_only = replace(base, sources=(*base.sources, current), epoch=base.epoch + 1)
+    expected = apply_draft_identity(base, source_only, current, draft)
+    for entity in expected.entities:
+        if entity in base.entities:
+            continue
+        actual = next((e for e in staged.entities if e.evidence == entity.evidence), None)
+        if actual is None or actual in base.entities:
+            raise PrivacyError("STATE_IDENTITY_NOT_APPLIED")
+        if any(
+            f.scope == "entity" and f.entity_id == entity.id for f in expected.facts
+        ) and not any(f.scope == "entity" and f.entity_id == actual.id for f in staged.facts):
+            raise PrivacyError("STATE_IDENTITY_NOT_APPLIED")
+    if not set(expected.links).issubset(staged.links):
+        raise PrivacyError("STATE_IDENTITY_NOT_APPLIED")

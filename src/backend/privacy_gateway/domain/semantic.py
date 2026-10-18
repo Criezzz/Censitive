@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from privacy_gateway.domain.redaction import PREFIX, PrivacyError
+from privacy_gateway.domain.serialization import strict_json
 
 Category = Literal["personal", "health", "financial", "credential", "confidential"]
 
@@ -47,7 +48,7 @@ class SemanticReport:
 
 def ground_proposals(raw: str, sources: tuple[str, ...]) -> tuple[Protection, ...]:
     try:
-        proposals = Proposals.model_validate_json(raw)
+        proposals = Proposals.model_validate(strict_json(raw, code="SEMANTIC_INVALID_OUTPUT"))
     except (ValidationError, ValueError):
         raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
     grounded = []

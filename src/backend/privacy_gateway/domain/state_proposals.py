@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from privacy_gateway.domain.models import SourceSpan
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.semantic import Category
+from privacy_gateway.domain.serialization import strict_json
 from privacy_gateway.domain.state import Fact, Link, State, unique_span
 
 
@@ -42,6 +43,24 @@ class StateProposals(StrictProposal):
 
 class DirectFactProposals(StateProposals):
     links: list[FactLinkProposal] = Field(max_length=0)
+
+
+class IndexedDirectFact(StrictProposal):
+    kind: Literal["direct_value", "direct_assertion"]
+    assertion: str = Field(min_length=1, max_length=800)
+    category: Category
+    evidence: str = Field(min_length=1, max_length=800)
+
+
+class IndexedSourceCheck(StrictProposal):
+    message: int = Field(ge=0)
+    status: Literal["none", "new", "uncertain"]
+    new_facts: list[IndexedDirectFact] = Field(max_length=32)
+
+
+class IndexedExtractionProposals(StrictProposal):
+    review_required: bool
+    checks: list[IndexedSourceCheck] = Field(max_length=128)
 
 
 class ReferenceMention(StrictProposal):
@@ -114,6 +133,18 @@ def indexed_reference_schema(index: ReferenceIndex) -> dict[str, Any]:
     return schema
 
 
+def indexed_extraction_schema(index: ReferenceIndex) -> dict[str, Any]:
+    index.validate(index.state)
+    schema = IndexedExtractionProposals.model_json_schema()
+    schema["properties"]["checks"]["minItems"] = len(index.sources)
+    schema["properties"]["checks"]["maxItems"] = len(index.sources)
+    if index.sources:
+        schema["$defs"]["IndexedSourceCheck"]["properties"]["message"]["enum"] = list(
+            range(len(index.sources))
+        )
+    return schema
+
+
 def reference_schema(state: State) -> dict[str, Any]:
     state.validate()
     schema = ReferenceProposals.model_json_schema()
@@ -180,7 +211,7 @@ def _span(state: State, proposal: QuoteRef) -> SourceSpan:
 def ground_state_proposals(raw: str, state: State) -> GroundedProposals:
     state.validate()
     try:
-        output = StateProposals.model_validate_json(raw)
+        output = StateProposals.model_validate(strict_json(raw, code="SEMANTIC_INVALID_OUTPUT"))
     except (ValidationError, ValueError):
         raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
     if output.review_required:
@@ -216,10 +247,57 @@ def ground_state_proposals(raw: str, state: State) -> GroundedProposals:
 def ground_direct_facts(raw: str, state: State) -> GroundedProposals:
     state.validate()
     try:
-        DirectFactProposals.model_validate_json(raw)
+        DirectFactProposals.model_validate(strict_json(raw, code="SEMANTIC_INVALID_OUTPUT"))
     except (ValidationError, ValueError):
         raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
     return ground_state_proposals(raw, state)
+
+
+def ground_indexed_extraction(raw: str, state: State, index: ReferenceIndex) -> GroundedProposals:
+    index.validate(state)
+    try:
+        output = IndexedExtractionProposals.model_validate(
+            strict_json(raw, code="SEMANTIC_INVALID_OUTPUT")
+        )
+    except (ValidationError, ValueError):
+        raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
+    if output.review_required:
+        raise PrivacyError("STATE_REVIEW_REQUIRED")
+    seen: set[int] = set()
+    candidates: list[NewFactProposal] = []
+    for check in output.checks:
+        if (
+            check.message >= len(index.sources)
+            or check.message in seen
+            or check.status == "uncertain"
+            or (check.status == "none" and check.new_facts)
+            or (check.status == "new" and not check.new_facts)
+        ):
+            raise PrivacyError("STATE_REVIEW_REQUIRED")
+        seen.add(check.message)
+        source_id, revision, _ = index.sources[check.message]
+        for candidate in check.new_facts:
+            candidates.append(
+                NewFactProposal(
+                    assertion=QuoteRef(
+                        source_id=source_id, source_revision=revision, quote=candidate.assertion
+                    ),
+                    category=candidate.category,
+                    evidence=QuoteRef(
+                        source_id=source_id, source_revision=revision, quote=candidate.evidence
+                    ),
+                )
+            )
+    if seen != set(range(len(index.sources))):
+        raise PrivacyError("STATE_REVIEW_REQUIRED")
+    if len(candidates) > 32:
+        raise PrivacyError("SEMANTIC_INVALID_OUTPUT")
+    return ground_direct_facts(
+        DirectFactProposals(
+            review_required=False, new_facts=candidates, links=[]
+        ).model_dump_json(),
+        state,
+    )
 
 
 def stage_proposals(state: State, proposal: GroundedProposals) -> State:
@@ -240,7 +318,7 @@ def stage_proposals(state: State, proposal: GroundedProposals) -> State:
 def ground_reference_checks(raw: str, state: State) -> GroundedProposals:
     state.validate()
     try:
-        output = ReferenceProposals.model_validate_json(raw)
+        output = ReferenceProposals.model_validate(strict_json(raw, code="SEMANTIC_INVALID_OUTPUT"))
     except (ValidationError, ValueError):
         raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
     if output.review_required:
@@ -280,7 +358,9 @@ def ground_reference_checks(raw: str, state: State) -> GroundedProposals:
 def ground_indexed_references(raw: str, state: State, index: ReferenceIndex) -> GroundedProposals:
     index.validate(state)
     try:
-        output = IndexedReferenceProposals.model_validate_json(raw)
+        output = IndexedReferenceProposals.model_validate(
+            strict_json(raw, code="SEMANTIC_INVALID_OUTPUT")
+        )
     except (ValidationError, ValueError):
         raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
     checks = []

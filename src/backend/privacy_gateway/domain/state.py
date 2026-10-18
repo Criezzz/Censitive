@@ -149,12 +149,28 @@ class State:
         if len(self.entities) >= MAX_FACTS:
             raise PrivacyError("STATE_LIMIT")
         entity = Entity(secrets.token_hex(16), evidence)
+        self._check_identity_occurrence(evidence, entity.id)
         return replace(
             self,
             entities=(*self.entities, entity),
             epoch=self.epoch + 1,
             protection_epoch=self.protection_epoch + 1,
         ), entity
+
+    def _check_identity_occurrence(self, mention: SourceSpan, target: str) -> None:
+        assignments = [(entity.evidence, entity.id) for entity in self.entities]
+        assignments.extend(
+            (link.mention, link.target) for link in self.links if link.relation == "alias"
+        )
+        if any(
+            other != target
+            and span.message_id == mention.message_id
+            and span.message_revision == mention.message_revision
+            and span.start < mention.end
+            and mention.start < span.end
+            for span, other in assignments
+        ):
+            raise PrivacyError("STATE_AMBIGUOUS_LINK")
 
     def add_fact(
         self,
@@ -217,12 +233,35 @@ class State:
             entity = next((e for e in self.entities if e.id == link.target), None)
             if entity is None or link.target_revision != 1 or link.evidence != entity.evidence:
                 raise PrivacyError("STATE_EVIDENCE_MISMATCH")
+            self._check_identity_occurrence(link.mention, link.target)
         else:
             fact = self.fact(link.target, link.target_revision)
             if link.evidence != fact.assertion:
                 raise PrivacyError("STATE_EVIDENCE_MISMATCH")
+            if fact.scope == "entity" and (
+                link.mention == fact.assertion
+                or any(
+                    old.relation == "alias"
+                    and old.target == fact.entity_id
+                    and old.mention == link.mention
+                    for old in self.links
+                )
+            ):
+                return self
         if any(
             (old.target, old.target_revision) != (link.target, link.target_revision)
+            and not (
+                link.relation == "alias"
+                and old.relation != "alias"
+                and old.mention == link.mention
+                and any(
+                    fact.id == old.target
+                    and fact.revision == old.target_revision
+                    and fact.scope == "entity"
+                    and fact.entity_id == link.target
+                    for fact in self.facts
+                )
+            )
             and (
                 old.mention == link.mention
                 or (
@@ -376,7 +415,14 @@ class State:
         if source_ids & entity_ids or set(groups) & (source_ids | entity_ids):
             raise PrivacyError("STATE_INVALID")
         for link in self.links:
+            if type(link) is not Link:
+                raise PrivacyError("STATE_INVALID")
+            self.quote(link.mention)
+            self.quote(link.evidence)
+        for link in self.links:
             self.add_link(link)
+        for entity in self.entities:
+            self._check_identity_occurrence(entity.evidence, entity.id)
         if len(set(self.links)) != len(self.links):
             raise PrivacyError("STATE_INVALID")
 
