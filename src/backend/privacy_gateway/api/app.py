@@ -2,8 +2,10 @@ import asyncio
 import json
 import re
 import secrets
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from math import ceil
 from pathlib import Path
 from typing import Annotated
 
@@ -17,11 +19,13 @@ from starlette.types import Receive, Scope, Send
 
 from privacy_gateway.adapters.connections import ProviderConnections
 from privacy_gateway.adapters.provider import StreamingProvider
-from privacy_gateway.application.gateway import Gateway
+from privacy_gateway.application.gateway import Gateway, Prepared, Session
 from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand
 from privacy_gateway.domain.manual_facts import CreateFact, DraftFacts
 from privacy_gateway.domain.models import SpanValidationError
+from privacy_gateway.domain.preview_review import RejectNewMask, review_items
 from privacy_gateway.domain.redaction import PrivacyError
+from privacy_gateway.domain.serialization import strict_json
 from privacy_gateway.domain.state import State
 
 
@@ -72,6 +76,12 @@ class IdentityInput(StrictInput):
 class CreateFactInput(StrictInput):
     operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     command: CreateFact
+
+
+class PreviewDecisionInput(StrictInput):
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    expected_epoch: int = Field(ge=0)
+    command: RejectNewMask
 
 
 def state_view(state: State, enabled: bool) -> dict[str, object]:
@@ -183,10 +193,20 @@ def create_app(
                 except PrivacyError as error:
                     return JSONResponse({"code": str(error)}, status_code=409)
             command_path = re.fullmatch(
-                r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/(?:correct|create))", request.url.path
+                r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/(?:correct|create))",
+                request.url.path,
+            )
+            review_path = re.fullmatch(
+                r"/api/sessions/([0-9a-f]{32})/prepared/([0-9a-f]{32})/decisions",
+                request.url.path,
             )
 
             def reject_body(code: str, status: int) -> JSONResponse:
+                if request.method == "POST" and review_path:
+                    try:
+                        service.discard(service.session(review_path[1], owner), review_path[2])
+                    except PrivacyError as error:
+                        return JSONResponse({"code": str(error)}, status_code=409)
                 if request.method == "POST" and command_path:
                     try:
                         service.discard(service.session(command_path[1], owner))
@@ -212,6 +232,11 @@ def create_app(
                 if len(received) > 100_000:
                     return reject_body("INPUT_TOO_LARGE", 413)
             request._body = bytes(received)
+            if request.method == "POST" and review_path:
+                try:
+                    strict_json(request._body)
+                except PrivacyError:
+                    return reject_body("INVALID_INPUT", 422)
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -244,6 +269,14 @@ def create_app(
         command_path = re.fullmatch(
             r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/(?:correct|create))", request.url.path
         )
+        review_path = re.fullmatch(
+            r"/api/sessions/([0-9a-f]{32})/prepared/([0-9a-f]{32})/decisions", request.url.path
+        )
+        if request.method == "POST" and review_path:
+            try:
+                service.discard(service.session(review_path[1], owner(request)), review_path[2])
+            except PrivacyError as error:
+                return JSONResponse({"code": str(error)}, status_code=409)
         if request.method == "POST" and command_path:
             try:
                 service.discard(service.session(command_path[1], owner(request)))
@@ -394,34 +427,30 @@ def create_app(
         )
         return state_view(session.state, True)
 
-    @app.post("/api/sessions/{session_id}/prepare")
-    async def prepare(session_id: str, data: PrepareInput, request: Request) -> dict[str, object]:
-        session = service.session(session_id, owner(request))
-        prepared = await service.prepare_message(
-            session,
-            data.text,
-            tuple(data.terms),
-            data.request_id,
-            draft_identity=data.draft_identity,
-            draft_facts=data.draft_facts,
-        )
+    def preview_view(prepared: Prepared, session: Session) -> dict[str, object]:
         return {
             "id": prepared.id,
             "sanitized": prepared.sanitized,
             "body": prepared.body.decode("utf-8"),
-            "expires_in": 300,
+            "expires_in": max(0, ceil(prepared.expires_at - time.monotonic())),
             "detections": [
                 {
                     "start": d.start,
                     "end": d.end,
                     "category": d.category,
-                    "value": data.text[d.start : d.end],
+                    "value": prepared.original[d.start : d.end],
                     "restore_allowed": d.restore_allowed,
                 }
                 for d in prepared.detections
             ],
             "history_count": len(session.provider_history),
             "streaming": isinstance(session.provider, StreamingProvider),
+            "review": None
+            if prepared.review_plan is None
+            else {
+                "expected_epoch": prepared.review_plan.base.epoch,
+                "items": review_items(prepared.review_plan, prepared.literal_policies),
+            },
             "state": state_view(prepared.staged_state, True)
             if prepared.staged_state is not None
             else None,
@@ -451,6 +480,42 @@ def create_app(
                     for p in prepared.semantic.protections
                 ],
             },
+        }
+
+    @app.post("/api/sessions/{session_id}/prepare")
+    async def prepare(session_id: str, data: PrepareInput, request: Request) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        prepared = await service.prepare_message(
+            session,
+            data.text,
+            tuple(data.terms),
+            data.request_id,
+            draft_identity=data.draft_identity,
+            draft_facts=data.draft_facts,
+        )
+        return preview_view(prepared, session)
+
+    @app.post("/api/sessions/{session_id}/prepared/{prepared_id}/decisions")
+    async def review_preview(
+        session_id: str, prepared_id: str, data: PreviewDecisionInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        receipt, prepared = service.review_preview(
+            session,
+            prepared_id,
+            data.operation_id,
+            data.expected_epoch,
+            data.command,
+        )
+        return {
+            "receipt": {
+                "operation_id": data.operation_id,
+                "old_prepared_id": receipt.old_prepared_id,
+                "new_prepared_id": receipt.new_prepared_id,
+                "body_sha256": receipt.body_sha256,
+            },
+            "preview_available": prepared is not None,
+            "preview": None if prepared is None else preview_view(prepared, session),
         }
 
     @app.post("/api/sessions/{session_id}/cancel-prepare")

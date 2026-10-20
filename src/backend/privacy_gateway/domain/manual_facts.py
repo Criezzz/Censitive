@@ -1,7 +1,7 @@
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from privacy_gateway.domain.identity import (
     Digest,
@@ -18,7 +18,9 @@ from privacy_gateway.domain.state import Fact, Source, State
 
 
 class StrictFactCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, revalidate_instances="always"
+    )
 
 
 class CreateFact(StrictFactCommand):
@@ -50,10 +52,18 @@ class FactResult:
     fact: Fact
 
 
-def apply_manual_fact(base: State, command: CreateFact) -> FactResult:
-    base.validate()
+def validate_manual_fact(command: CreateFact) -> CreateFact:
     if type(command) is not CreateFact:
         raise PrivacyError("STATE_INVALID")
+    try:
+        return CreateFact.model_validate(command)
+    except ValidationError:
+        raise PrivacyError("STATE_INVALID") from None
+
+
+def apply_manual_fact(base: State, command: CreateFact) -> FactResult:
+    base.validate()
+    command = validate_manual_fact(command)
     if command.expected_epoch != base.epoch:
         raise PrivacyError("STATE_STALE")
     span = _committed_span(base, command.evidence)
@@ -62,10 +72,16 @@ def apply_manual_fact(base: State, command: CreateFact) -> FactResult:
     return FactResult(state, fact)
 
 
-def _source_only(base: State, current: Source, draft: DraftFacts) -> State:
+def _source_only(base: State, current: Source, draft: DraftFacts) -> tuple[State, DraftFacts]:
     base.validate()
     if type(draft) is not DraftFacts or type(current) is not Source:
         raise PrivacyError("STATE_INVALID")
+    if type(getattr(draft, "marks", None)) is not tuple:
+        raise PrivacyError("STATE_INVALID")
+    try:
+        draft = DraftFacts.model_validate(draft)
+    except ValidationError:
+        raise PrivacyError("STATE_INVALID") from None
     if (
         draft.expected_epoch != base.epoch
         or draft.text_digest != current.digest
@@ -74,7 +90,7 @@ def _source_only(base: State, current: Source, draft: DraftFacts) -> State:
         raise PrivacyError("STATE_STALE")
     state = replace(base, sources=(*base.sources, current), epoch=base.epoch + 1)
     state.validate()
-    return state
+    return state, draft
 
 
 def apply_draft_facts(
@@ -85,7 +101,7 @@ def apply_draft_facts(
     *,
     draft_identity: DraftIdentity | None = None,
 ) -> State:
-    source_only = _source_only(base, current, draft)
+    source_only, draft = _source_only(base, current, draft)
     if staged != source_only:
         raise PrivacyError("STATE_STALE")
     state = (
@@ -101,7 +117,7 @@ def apply_draft_facts(
 
 
 def verify_draft_facts(base: State, staged: State, current: Source, draft: DraftFacts) -> None:
-    _source_only(base, current, draft)
+    _, draft = _source_only(base, current, draft)
     staged.validate()
     if staged.source(current.id) != current:
         raise PrivacyError("STATE_SOURCE_MISMATCH")

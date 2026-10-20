@@ -7,9 +7,11 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import aclosing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING
+
+from pydantic import ValidationError
 
 from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_detector import SemanticDetector
@@ -19,6 +21,7 @@ from privacy_gateway.domain.identity import (
     DraftIdentity,
     IdentityCommand,
     apply_identity,
+    validate_identity_command,
     verify_draft_identity,
 )
 from privacy_gateway.domain.incremental import Compilation, CompiledSource, compile_state
@@ -26,9 +29,16 @@ from privacy_gateway.domain.manual_facts import (
     CreateFact,
     DraftFacts,
     apply_manual_fact,
+    validate_manual_fact,
     verify_draft_facts,
 )
 from privacy_gateway.domain.models import Replacement, SourceSpan
+from privacy_gateway.domain.preview_review import (
+    RejectNewMask,
+    ReviewPlan,
+    reject_new_mask,
+    reviewed_state,
+)
 from privacy_gateway.domain.redaction import (
     PREFIX,
     TOKEN,
@@ -80,6 +90,7 @@ class Prepared:
     expected_messages: tuple[Message, ...] = ()
     resolver_calls: int = 0
     resolver_full_fallback: bool = False
+    review_plan: ReviewPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +101,9 @@ class CommandReceipt:
     policy_fact_id: str | None = None
     fact_id: str = ""
     fact_revision: int = 0
+    old_prepared_id: str = ""
+    new_prepared_id: str = ""
+    body_sha256: str = ""
 
 
 @dataclass
@@ -333,7 +347,15 @@ class Gateway:
                     resolution.current_source,
                     draft_identity,
                 )
-            return self.prepare_stateful(session, text, terms, resolution, attempt)
+            return self.prepare_stateful(
+                session,
+                text,
+                terms,
+                resolution,
+                attempt,
+                draft_identity=draft_identity,
+                draft_facts=draft_facts,
+            )
         return self.prepare(session, text, terms, report=report, request_id=attempt)
 
     def correct_fact(
@@ -374,6 +396,11 @@ class Gateway:
     ) -> CommandReceipt:
         if self.resolver is None:
             raise PrivacyError("STATE_DISABLED")
+        try:
+            command = validate_identity_command(command)
+        except PrivacyError:
+            self.discard(session)
+            raise
         signature = hashlib.sha256(command.model_dump_json().encode("utf-8")).hexdigest()
         previous = session.commands.get(operation_id)
         if previous is not None:
@@ -400,6 +427,11 @@ class Gateway:
     ) -> CommandReceipt:
         if self.resolver is None:
             raise PrivacyError("STATE_DISABLED")
+        try:
+            command = validate_manual_fact(command)
+        except PrivacyError:
+            self.discard(session)
+            raise
         signature = hashlib.sha256(command.model_dump_json().encode("utf-8")).hexdigest()
         previous = session.commands.get(operation_id)
         if previous is not None:
@@ -430,6 +462,10 @@ class Gateway:
         terms: tuple[str, ...],
         resolution: Resolution,
         request_id: str,
+        *,
+        draft_identity: DraftIdentity | None = None,
+        draft_facts: DraftFacts | None = None,
+        review_plan: ReviewPlan | None = None,
     ) -> Prepared:
         self.discard(session)
         self.validate_input(session, text, terms)
@@ -457,6 +493,20 @@ class Gateway:
             if message.role == "assistant"
         }
         state = state.protect_credentials(tuple(assistant_views.values()))
+        if review_plan is None and resolution.trusted_state is not None:
+            review_plan = ReviewPlan(
+                session.state,
+                resolution.trusted_state,
+                state,
+                current.id,
+                draft_identity,
+                draft_facts,
+            )
+        if (
+            review_plan is not None
+            and reviewed_state(review_plan, session.state, literals) != state
+        ):
+            raise PrivacyError("PREVIEW_DECISION_INVALID")
         for token, binding in tuple(staged.items()):
             if binding.restore_allowed and any(
                 value in binding.value for value in state.denied_literals
@@ -526,11 +576,107 @@ class Gateway:
             tuple(messages),
             resolution.model_calls,
             resolution.full_fallback,
+            review_plan,
         )
         session.terms = terms
         session.prepared = prepared
         session.record("prepare", "ready")
         return prepared
+
+    def review_preview(
+        self,
+        session: Session,
+        prepared_id: str,
+        operation_id: str,
+        expected_epoch: int,
+        command: RejectNewMask,
+    ) -> tuple[CommandReceipt, Prepared | None]:
+        from privacy_gateway.adapters.state_resolver import Resolution
+        from privacy_gateway.domain.state_proposals import StateDelta
+
+        try:
+            if type(command) is not RejectNewMask:
+                raise ValueError("invalid command")
+            command = RejectNewMask.model_validate(command.model_dump(mode="python"))
+        except (ValidationError, ValueError, TypeError, AttributeError):
+            self.discard(session, prepared_id)
+            raise PrivacyError("PREVIEW_DECISION_INVALID") from None
+        signature = hashlib.sha256(
+            repr(("preview", prepared_id, expected_epoch, command.model_dump_json())).encode()
+        ).hexdigest()
+        previous = session.commands.get(operation_id)
+        if previous is not None:
+            if previous.signature != signature:
+                self.discard(session, prepared_id)
+                raise PrivacyError("STATE_COMMAND_CONFLICT")
+            child = session.prepared
+            available = (
+                child is not None
+                and child.id == previous.new_prepared_id
+                and child.version == session.version
+                and time.monotonic() < child.expires_at
+            )
+            return previous, child if available else None
+        if session.busy:
+            raise PrivacyError("SESSION_BUSY")
+        old = session.prepared
+        if old is None or old.id != prepared_id:
+            raise PrivacyError("STALE_PREVIEW")
+        self.discard(session)
+        if (
+            type(expected_epoch) is not int
+            or expected_epoch != session.state.epoch
+            or time.monotonic() >= old.expires_at
+            or old.provider_signature
+            != (
+                session.provider.provider_id,
+                session.provider.model,
+                session.provider.serializer_version,
+            )
+            or old.version != session.version - 1
+        ):
+            raise PrivacyError("STALE_PREVIEW")
+        if len(session.commands) >= 128:
+            raise PrivacyError("STATE_COMMAND_LIMIT")
+        if old.review_plan is None or old.semantic is None:
+            raise PrivacyError("PREVIEW_DECISION_LOCKED")
+        plan, state = reject_new_mask(old.review_plan, session.state, old.literal_policies, command)
+        current = state.source(old.source_id)
+        resolution = Resolution(
+            state,
+            current,
+            old.semantic,
+            tuple(s.id for s in state.sources),
+            old.resolver_full_fallback,
+            0,
+            StateDelta(
+                session.state,
+                state,
+                tuple(f for f in state.facts if f not in session.state.facts),
+                tuple(link for link in state.links if link not in session.state.links),
+            ),
+            (),
+        )
+        child = self.prepare_stateful(
+            session,
+            old.original,
+            session.terms,
+            resolution,
+            old.request_id,
+            review_plan=plan,
+        )
+        child = replace(child, expires_at=min(child.expires_at, old.expires_at))
+        session.prepared = child
+        receipt = CommandReceipt(
+            signature,
+            session.state.epoch,
+            old_prepared_id=old.id,
+            new_prepared_id=child.id,
+            body_sha256=hashlib.sha256(child.body).hexdigest(),
+        )
+        session.commands[operation_id] = receipt
+        session.record("preview_reviewed", "new_approval_required")
+        return receipt, child
 
     def cancel_prepare(self, session: Session, request_id: str) -> None:
         if len(session.cancelled_prepares) >= 128 and request_id not in session.cancelled_prepares:
@@ -637,6 +783,12 @@ class Gateway:
         if prepared.staged_state is not None:
             state = prepared.staged_state
             state.validate()
+            if (
+                prepared.review_plan is not None
+                and reviewed_state(prepared.review_plan, session.state, prepared.literal_policies)
+                != state
+            ):
+                raise PrivacyError("OUTBOUND_BLOCKED")
             reference = compile_state(
                 state,
                 prepared.literal_policies,

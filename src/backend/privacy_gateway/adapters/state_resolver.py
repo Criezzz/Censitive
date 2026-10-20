@@ -104,6 +104,7 @@ class Resolution:
     call_stages: tuple[str, ...] = ()
     extraction_payload_sha256: tuple[str, ...] = ()
     reused_extraction_payload_sha256: tuple[str, ...] = ()
+    trusted_state: State | None = None
 
 
 def generation_settings() -> dict[str, object]:
@@ -369,6 +370,7 @@ class LocalStateResolver(LocalDetector):
             )
         elif draft_identity is not None:
             staged = apply_draft_identity(base, staged, current, draft_identity)
+        trusted_state = staged
         context, _ = select_reference_context(staged, current, literals, full=full)
         if not self.key:
             raise PrivacyError("SEMANTIC_UNAVAILABLE")
@@ -502,6 +504,7 @@ class LocalStateResolver(LocalDetector):
                         call_stages=tuple(call_stages),
                         extraction_payload_sha256=tuple(extraction_payload_sha256),
                         reused_extraction_payload_sha256=tuple(reused_extraction_payload_sha256),
+                        trusted_state=trusted_state,
                     )
                 context, _ = select_reference_context(staged, current, literals, full=full)
         raise PrivacyError("STATE_REVIEW_REQUIRED")

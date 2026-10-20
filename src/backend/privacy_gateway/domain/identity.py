@@ -1,7 +1,7 @@
 from dataclasses import dataclass, replace
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from privacy_gateway.domain.models import SourceSpan
 from privacy_gateway.domain.redaction import PrivacyError
@@ -12,7 +12,9 @@ Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class StrictIdentity(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    model_config = ConfigDict(
+        extra="forbid", strict=True, frozen=True, revalidate_instances="always"
+    )
 
 
 class DraftOccurrence(StrictIdentity):
@@ -50,6 +52,15 @@ class ConfirmAlias(StrictIdentity):
 IdentityCommand = Annotated[
     CreateEntity | ProtectEntity | ConfirmAlias, Field(discriminator="kind")
 ]
+
+
+def validate_identity_command(command: IdentityCommand) -> IdentityCommand:
+    if type(command) not in (CreateEntity, ProtectEntity, ConfirmAlias):
+        raise PrivacyError("STATE_INVALID")
+    try:
+        return type(command).model_validate(command)
+    except ValidationError:
+        raise PrivacyError("STATE_INVALID") from None
 
 
 class DraftCreate(StrictIdentity):
@@ -120,8 +131,7 @@ def _protect(state: State, entity: Entity) -> IdentityResult:
 
 def apply_identity(state: State, command: IdentityCommand) -> IdentityResult:
     state.validate()
-    if type(command) not in (CreateEntity, ProtectEntity, ConfirmAlias):
-        raise PrivacyError("STATE_INVALID")
+    command = validate_identity_command(command)
     if state.epoch != command.expected_epoch:
         raise PrivacyError("STATE_STALE")
     if isinstance(command, CreateEntity):
@@ -151,6 +161,12 @@ def apply_draft_identity(
     staged.validate()
     if type(draft) is not DraftIdentity or type(current) is not Source:
         raise PrivacyError("STATE_INVALID")
+    if type(getattr(draft, "actions", None)) is not tuple:
+        raise PrivacyError("STATE_INVALID")
+    try:
+        draft = DraftIdentity.model_validate(draft)
+    except ValidationError:
+        raise PrivacyError("STATE_INVALID") from None
     if draft.expected_epoch != base.epoch or draft.text_digest != current.digest:
         raise PrivacyError("STATE_STALE")
     if current.id in {source.id for source in base.sources} or staged != replace(
