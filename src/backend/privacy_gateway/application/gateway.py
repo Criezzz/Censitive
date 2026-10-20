@@ -22,6 +22,12 @@ from privacy_gateway.domain.identity import (
     verify_draft_identity,
 )
 from privacy_gateway.domain.incremental import Compilation, CompiledSource, compile_state
+from privacy_gateway.domain.manual_facts import (
+    CreateFact,
+    DraftFacts,
+    apply_manual_fact,
+    verify_draft_facts,
+)
 from privacy_gateway.domain.models import Replacement, SourceSpan
 from privacy_gateway.domain.redaction import (
     PREFIX,
@@ -82,6 +88,8 @@ class CommandReceipt:
     committed_epoch: int
     entity_id: str = ""
     policy_fact_id: str | None = None
+    fact_id: str = ""
+    fact_revision: int = 0
 
 
 @dataclass
@@ -253,8 +261,9 @@ class Gateway:
         request_id: str | None = None,
         *,
         draft_identity: DraftIdentity | None = None,
+        draft_facts: DraftFacts | None = None,
     ) -> Prepared:
-        if draft_identity is not None and self.resolver is None:
+        if (draft_identity is not None or draft_facts is not None) and self.resolver is None:
             self.discard(session)
             raise PrivacyError("STATE_DISABLED")
         if self.detector is None and self.resolver is None:
@@ -272,7 +281,15 @@ class Gateway:
         try:
             if self.resolver is not None:
                 literals = tuple(dict.fromkeys((*session.literal_policies, *terms)))
-                if draft_identity is None:
+                if draft_facts is not None:
+                    resolution = await self.resolver.resolve(
+                        session.state,
+                        text,
+                        literals,
+                        draft_identity=draft_identity,
+                        draft_facts=draft_facts,
+                    )
+                elif draft_identity is None:
                     resolution = await self.resolver.resolve(session.state, text, literals)
                 else:
                     resolution = await self.resolver.resolve(
@@ -302,6 +319,13 @@ class Gateway:
             raise PrivacyError("CANCELLED")
         self.validate_input(session, text, terms)
         if resolution is not None:
+            if draft_facts is not None:
+                verify_draft_facts(
+                    session.state,
+                    resolution.staged_state,
+                    resolution.current_source,
+                    draft_facts,
+                )
             if draft_identity is not None:
                 verify_draft_identity(
                     session.state,
@@ -369,6 +393,34 @@ class Gateway:
         session.state = result.state
         session.commands[operation_id] = receipt
         session.record("identity_" + command.kind, "committed_locally")
+        return receipt
+
+    def create_fact(
+        self, session: Session, command: CreateFact, operation_id: str
+    ) -> CommandReceipt:
+        if self.resolver is None:
+            raise PrivacyError("STATE_DISABLED")
+        signature = hashlib.sha256(command.model_dump_json().encode("utf-8")).hexdigest()
+        previous = session.commands.get(operation_id)
+        if previous is not None:
+            if previous.signature != signature:
+                self.discard(session)
+                raise PrivacyError("STATE_COMMAND_CONFLICT")
+            return previous
+        if len(session.commands) >= 128:
+            self.discard(session)
+            raise PrivacyError("STATE_COMMAND_LIMIT")
+        self.discard(session)
+        result = apply_manual_fact(session.state, command)
+        receipt = CommandReceipt(
+            signature,
+            result.state.epoch,
+            fact_id=result.fact.id,
+            fact_revision=result.fact.revision,
+        )
+        session.state = result.state
+        session.commands[operation_id] = receipt
+        session.record("fact_created", "committed_locally")
         return receipt
 
     def prepare_stateful(

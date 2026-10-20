@@ -19,6 +19,7 @@ from privacy_gateway.adapters.connections import ProviderConnections
 from privacy_gateway.adapters.provider import StreamingProvider
 from privacy_gateway.application.gateway import Gateway
 from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand
+from privacy_gateway.domain.manual_facts import CreateFact, DraftFacts
 from privacy_gateway.domain.models import SpanValidationError
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.state import State
@@ -48,6 +49,7 @@ class PrepareInput(StrictInput):
     )
     request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     draft_identity: DraftIdentity | None = None
+    draft_facts: DraftFacts | None = None
 
 
 class SnapshotInput(StrictInput):
@@ -65,6 +67,11 @@ class CorrectionInput(StrictInput):
 class IdentityInput(StrictInput):
     operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     command: IdentityCommand
+
+
+class CreateFactInput(StrictInput):
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    command: CreateFact
 
 
 def state_view(state: State, enabled: bool) -> dict[str, object]:
@@ -176,7 +183,7 @@ def create_app(
                 except PrivacyError as error:
                     return JSONResponse({"code": str(error)}, status_code=409)
             command_path = re.fullmatch(
-                r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/correct)", request.url.path
+                r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/(?:correct|create))", request.url.path
             )
 
             def reject_body(code: str, status: int) -> JSONResponse:
@@ -235,7 +242,7 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, _: RequestValidationError) -> JSONResponse:
         command_path = re.fullmatch(
-            r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/correct)", request.url.path
+            r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/(?:correct|create))", request.url.path
         )
         if request.method == "POST" and command_path:
             try:
@@ -356,6 +363,22 @@ def create_app(
             "state": state_view(session.state, True),
         }
 
+    @app.post("/api/sessions/{session_id}/facts/create")
+    async def create_fact(
+        session_id: str, data: CreateFactInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        receipt = service.create_fact(session, data.command, data.operation_id)
+        return {
+            "receipt": {
+                "operation_id": data.operation_id,
+                "committed_epoch": receipt.committed_epoch,
+                "fact_id": receipt.fact_id,
+                "fact_revision": receipt.fact_revision,
+            },
+            "state": state_view(session.state, True),
+        }
+
     @app.post("/api/sessions/{session_id}/facts/correct")
     async def correct_fact(
         session_id: str, data: CorrectionInput, request: Request
@@ -380,6 +403,7 @@ def create_app(
             tuple(data.terms),
             data.request_id,
             draft_identity=data.draft_identity,
+            draft_facts=data.draft_facts,
         )
         return {
             "id": prepared.id,

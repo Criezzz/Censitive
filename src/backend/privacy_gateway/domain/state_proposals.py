@@ -59,7 +59,6 @@ class IndexedSourceCheck(StrictProposal):
 
 
 class IndexedExtractionProposals(StrictProposal):
-    review_required: bool
     checks: list[IndexedSourceCheck] = Field(max_length=128)
 
 
@@ -261,8 +260,6 @@ def ground_indexed_extraction(raw: str, state: State, index: ReferenceIndex) -> 
         )
     except (ValidationError, ValueError):
         raise PrivacyError("SEMANTIC_INVALID_OUTPUT") from None
-    if output.review_required:
-        raise PrivacyError("STATE_REVIEW_REQUIRED")
     seen: set[int] = set()
     candidates: list[NewFactProposal] = []
     for check in output.checks:

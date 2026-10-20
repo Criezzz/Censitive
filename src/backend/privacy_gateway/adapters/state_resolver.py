@@ -11,6 +11,7 @@ from privacy_gateway.adapters.local_detector import (
     complete_local_json,
 )
 from privacy_gateway.domain.identity import DraftIdentity, apply_draft_identity
+from privacy_gateway.domain.manual_facts import DraftFacts, apply_draft_facts
 from privacy_gateway.domain.models import SourceSpan
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.semantic import Protection, SemanticReport
@@ -319,6 +320,7 @@ class StateResolver(Protocol):
         *,
         full: bool = False,
         draft_identity: DraftIdentity | None = None,
+        draft_facts: DraftFacts | None = None,
     ) -> Resolution: ...
 
 
@@ -331,6 +333,7 @@ class LocalStateResolver(LocalDetector):
         *,
         full: bool = False,
         draft_identity: DraftIdentity | None = None,
+        draft_facts: DraftFacts | None = None,
         incremental: bool = False,
     ) -> Resolution:
         try:
@@ -341,6 +344,7 @@ class LocalStateResolver(LocalDetector):
                     literals,
                     full=full,
                     draft_identity=draft_identity,
+                    draft_facts=draft_facts,
                     incremental=incremental,
                 )
         except TimeoutError:
@@ -354,13 +358,18 @@ class LocalStateResolver(LocalDetector):
         *,
         full: bool,
         draft_identity: DraftIdentity | None,
+        draft_facts: DraftFacts | None,
         incremental: bool,
     ) -> Resolution:
         base.validate()
         staged, current = base.add_source(text)
-        if draft_identity is not None:
+        if draft_facts is not None:
+            staged = apply_draft_facts(
+                base, staged, current, draft_facts, draft_identity=draft_identity
+            )
+        elif draft_identity is not None:
             staged = apply_draft_identity(base, staged, current, draft_identity)
-        context = select_context(staged, current, literals, full=full)
+        context, _ = select_reference_context(staged, current, literals, full=full)
         if not self.key:
             raise PrivacyError("SEMANTIC_UNAVAILABLE")
         if self.lock.locked():
@@ -455,7 +464,7 @@ class LocalStateResolver(LocalDetector):
                     remember(proposal, staged)
                     staged = stage_proposals(staged, proposal)
                     negative_extraction_signature = signature if not proposal.facts else None
-                context = select_context(staged, current, literals, full=full)
+                context, _ = select_reference_context(staged, current, literals, full=full)
                 if staged.facts:
                     raw = await request()
                     assert reference_index is not None
@@ -494,5 +503,5 @@ class LocalStateResolver(LocalDetector):
                         extraction_payload_sha256=tuple(extraction_payload_sha256),
                         reused_extraction_payload_sha256=tuple(reused_extraction_payload_sha256),
                     )
-                context = select_context(staged, current, literals, full=full)
+                context, _ = select_reference_context(staged, current, literals, full=full)
         raise PrivacyError("STATE_REVIEW_REQUIRED")
