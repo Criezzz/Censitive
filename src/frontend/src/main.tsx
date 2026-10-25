@@ -7,9 +7,11 @@ import {
   identityErrors,
   selectedOccurrence,
   type DraftAction,
+  type DraftFact,
   type DraftOccurrence,
-  type IdentityCommand,
   type IdentityResult,
+  type FactResult,
+  type ProtectionCommand,
 } from "./IdentityPanel";
 import {
   FactPanel,
@@ -51,7 +53,48 @@ type Preview = {
     value: string;
     restore_allowed: boolean;
   }[];
+  review?: {
+    expected_epoch: number;
+    items: {
+      candidate_id: string;
+      start: number;
+      end: number;
+      quote: string;
+      can_reject: boolean;
+      locked_reason: string;
+      rejected: boolean;
+    }[];
+  } | null;
 };
+type PreviewDecision = {
+  operation_id: string;
+  prepared_id: string;
+  expected_epoch: number;
+  command: { kind: "reject_new_mask"; candidate_id: string };
+};
+type PreviewDecisionResult = {
+  receipt: {
+    operation_id: string;
+    old_prepared_id: string;
+    new_prepared_id: string;
+    body_sha256: string;
+  };
+  preview_available: boolean;
+  preview: Preview | null;
+};
+const reviewErrors = new Set([
+  "STALE_PREVIEW",
+  "STATE_STALE",
+  "SESSION_BUSY",
+  "STATE_COMMAND_CONFLICT",
+  "STATE_COMMAND_LIMIT",
+  "PREVIEW_DECISION_LOCKED",
+  "PREVIEW_DECISION_INVALID",
+  "STATE_FACT_MISSING",
+  "INVALID_INPUT",
+  "STATE_INVALID",
+  "STATE_LIMIT",
+]);
 type SessionView = {
   id: string;
   provider: string;
@@ -109,6 +152,16 @@ const errors: Record<string, string> = {
     "Các lựa chọn chồng lên nhau nhưng chỉ tới những định danh khác nhau. Hãy bỏ lựa chọn nháp rồi chọn lại.",
   STATE_IDENTITY_NOT_APPLIED:
     "Bản chuẩn bị chưa giữ đầy đủ lựa chọn bảo vệ danh tính. Chưa gửi; hãy chuẩn bị lại.",
+  STATE_FACT_NOT_APPLIED:
+    "Bản chuẩn bị chưa giữ đầy đủ thông tin bạn chọn bảo vệ. Chưa gửi; hãy chuẩn bị lại.",
+  IDENTITY_OUTCOME_UNKNOWN:
+    "Chưa xác nhận kết quả thao tác bảo vệ. Hãy kiểm tra lại đúng thao tác đang chờ trước khi tiếp tục.",
+  PREVIEW_DECISION_LOCKED:
+    "Đề xuất này liên quan đến quy tắc hoặc thông tin đang được bảo vệ, nên không thể bỏ che tại đây. Hãy chuẩn bị lại.",
+  PREVIEW_DECISION_INVALID:
+    "Lựa chọn không còn khớp bản chuẩn bị. Chưa gửi; hãy chuẩn bị lại.",
+  PREVIEW_OUTCOME_UNKNOWN:
+    "Chưa xác nhận thay đổi bản gửi. Kiểm tra lại đúng thao tác đang chờ; không tự gửi lại.",
   SEMANTIC_MODEL_MISMATCH:
     "Runtime đang trả lời bằng model khác cấu hình. Hãy khởi động lại đúng profile trước khi chuẩn bị bản gửi.",
   SEMANTIC_UNAVAILABLE:
@@ -228,6 +281,7 @@ function App() {
   const [identityConfirmed, setIdentityConfirmed] = useState(true);
   const identityOperation = useRef<string | null>(null);
   const [draftActions, setDraftActions] = useState<DraftAction[]>([]);
+  const [draftFacts, setDraftFacts] = useState<DraftFact[]>([]);
   const [draftSelection, setDraftSelection] = useState<DraftOccurrence | null>(
     null,
   );
@@ -240,6 +294,9 @@ function App() {
   const [terms, setTerms] = useState("");
   const [phase, setPhase] = useState<Phase>("loading");
   const [preview, setPreview] = useState<Preview | null>(null);
+  const [pendingReview, setPendingReview] = useState<PreviewDecision | null>(
+    null,
+  );
   const [error, setError] = useState("");
   const [inspect, setInspect] = useState<"preview" | "json" | "evidence">(
     "preview",
@@ -252,7 +309,10 @@ function App() {
   const input = useRef<HTMLTextAreaElement>(null);
   const providerButton = useRef<HTMLButtonElement>(null);
   const busy =
-    phase === "preparing" || phase === "sending" || phase === "loading";
+    phase === "preparing" ||
+    phase === "sending" ||
+    phase === "loading" ||
+    pendingReview !== null;
 
   function explain(reason: unknown) {
     const code = reason instanceof Error ? reason.message : "REQUEST_FAILED";
@@ -305,11 +365,13 @@ function App() {
   }, [messages, phase, provisional]);
   useEffect(() => {
     setDraftActions([]);
+    setDraftFacts([]);
     setDraftSelection(null);
   }, [factState?.epoch, session, provider]);
 
   function clearDraftIdentity() {
     setDraftActions([]);
+    setDraftFacts([]);
     setDraftSelection(null);
   }
   function invalidate(clearIdentity = true) {
@@ -375,21 +437,31 @@ function App() {
     try {
       const text = draft;
       const actions = draftActions;
+      const marks = draftFacts;
       const epoch = factState?.epoch;
       let draftIdentity;
-      if (actions.length) {
+      let draftFactInput;
+      if (actions.length || marks.length) {
         const bytes = await crypto.subtle.digest(
           "SHA-256",
           new TextEncoder().encode(text),
         );
         if (attempt !== generation.current) return;
-        draftIdentity = {
-          expected_epoch: epoch,
-          text_digest: Array.from(new Uint8Array(bytes), (byte) =>
-            byte.toString(16).padStart(2, "0"),
-          ).join(""),
-          actions,
-        };
+        const textDigest = Array.from(new Uint8Array(bytes), (byte) =>
+          byte.toString(16).padStart(2, "0"),
+        ).join("");
+        if (actions.length)
+          draftIdentity = {
+            expected_epoch: epoch,
+            text_digest: textDigest,
+            actions,
+          };
+        if (marks.length)
+          draftFactInput = {
+            expected_epoch: epoch,
+            text_digest: textDigest,
+            marks,
+          };
       }
       const result = await api<Preview>(
         `/sessions/${session}/prepare`,
@@ -402,6 +474,7 @@ function App() {
             .map((t) => t.trim())
             .filter(Boolean),
           ...(draftIdentity ? { draft_identity: draftIdentity } : {}),
+          ...(draftFactInput ? { draft_facts: draftFactInput } : {}),
         },
       );
       if (attempt !== generation.current) return;
@@ -418,8 +491,104 @@ function App() {
   async function waitStreamCancellation() {
     await streamCancellation.current?.catch(() => {});
   }
+  async function reviewPreview(candidateId?: string) {
+    if (
+      phase === "loading" ||
+      phase === "preparing" ||
+      phase === "sending" ||
+      !session ||
+      !identityConfirmed ||
+      !factsConfirmed ||
+      !providerConfirmed
+    )
+      return;
+    if (
+      !pendingReview &&
+      (!preview?.review ||
+        !candidateId ||
+        !preview.review.items.some(
+          (item) => item.candidate_id === candidateId && item.can_reject,
+        ))
+    )
+      return;
+    const operation = pendingReview ?? {
+      operation_id: crypto.randomUUID().replaceAll("-", ""),
+      prepared_id: preview!.id,
+      expected_epoch: preview!.review!.expected_epoch,
+      command: { kind: "reject_new_mask" as const, candidate_id: candidateId! },
+    };
+    const attempt = pendingReview ? generation.current : ++generation.current;
+    setPendingReview(operation);
+    setPreview(null);
+    setPhase("loading");
+    setError("");
+    try {
+      const { prepared_id, ...body } = operation;
+      const result = await api<PreviewDecisionResult>(
+        `/sessions/${session}/prepared/${prepared_id}/decisions`,
+        "POST",
+        body,
+      );
+      const receipt = result.receipt;
+      if (
+        receipt?.operation_id !== operation.operation_id ||
+        receipt.old_prepared_id !== operation.prepared_id ||
+        receipt.new_prepared_id === operation.prepared_id ||
+        !/^[a-f0-9]{32}$/.test(receipt.new_prepared_id) ||
+        !/^[a-f0-9]{64}$/.test(receipt.body_sha256) ||
+        typeof result.preview_available !== "boolean"
+      )
+        throw new Error("PREVIEW_OUTCOME_UNKNOWN");
+      if (result.preview_available) {
+        if (
+          !result.preview ||
+          result.preview.id !== receipt.new_prepared_id ||
+          typeof result.preview.body !== "string"
+        )
+          throw new Error("PREVIEW_OUTCOME_UNKNOWN");
+        const digest = await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(result.preview.body),
+        );
+        const actual = Array.from(new Uint8Array(digest), (byte) =>
+          byte.toString(16).padStart(2, "0"),
+        ).join("");
+        if (actual !== receipt.body_sha256)
+          throw new Error("PREVIEW_OUTCOME_UNKNOWN");
+      } else if (result.preview !== null)
+        throw new Error("PREVIEW_OUTCOME_UNKNOWN");
+      if (attempt !== generation.current) return;
+      setPendingReview(null);
+      setPreview(result.preview);
+      setInspect("preview");
+      setPhase(result.preview ? "ready" : "idle");
+      setError(
+        result.preview
+          ? "Đã tạo bản gửi mới. Hãy xem lại và duyệt trước khi gửi."
+          : "Đã xác nhận thao tác, nhưng bản gửi đó không còn hiệu lực. Hãy chuẩn bị lại; không tự gửi lại.",
+      );
+    } catch (reason) {
+      if (attempt !== generation.current) return;
+      explain(reason);
+      if (reason instanceof Error && reviewErrors.has(reason.message)) {
+        try {
+          await refresh(session);
+          setPendingReview(null);
+        } catch {
+          setError(errors.PREVIEW_OUTCOME_UNKNOWN);
+        }
+      }
+      setPhase("idle");
+    }
+  }
   async function send() {
-    if (!preview || phase !== "ready" || !factsConfirmed || !identityConfirmed)
+    if (
+      !preview ||
+      phase !== "ready" ||
+      !factsConfirmed ||
+      !identityConfirmed ||
+      pendingReview
+    )
       return;
     const streaming = preview.streaming === true;
     const controller = streaming ? new AbortController() : null;
@@ -543,7 +712,7 @@ function App() {
       setPhase("idle");
     }
   }
-  async function changeIdentity(command: IdentityCommand) {
+  async function changeIdentity(command: ProtectionCommand) {
     if (busy || !session || !factsConfirmed || !providerConfirmed)
       throw new Error("SESSION_BUSY");
     if (
@@ -561,8 +730,9 @@ function App() {
     setPhase("loading");
     setError("");
     try {
-      const result = await api<IdentityResult>(
-        `/sessions/${session}/identity`,
+      const factCommand = command.command.kind === "create_fact";
+      const result = await api<IdentityResult | FactResult>(
+        `/sessions/${session}/${factCommand ? "facts/create" : "identity"}`,
         "POST",
         command,
       );
@@ -574,6 +744,21 @@ function App() {
         result.state.epoch < result.receipt.committed_epoch
       )
         throw new Error("IDENTITY_OUTCOME_UNKNOWN");
+      if (factCommand) {
+        const receipt = result.receipt;
+        if (
+          !("fact_id" in receipt) ||
+          !/^[a-f0-9]{32}$/.test(receipt.fact_id) ||
+          !Number.isInteger(receipt.fact_revision) ||
+          receipt.fact_revision < 1 ||
+          !result.state.facts.some(
+            (fact) =>
+              fact.id === receipt.fact_id &&
+              fact.revision === receipt.fact_revision,
+          )
+        )
+          throw new Error("IDENTITY_OUTCOME_UNKNOWN");
+      }
       setFactState(result.state);
       setIdentityConfirmed(true);
       identityOperation.current = null;
@@ -618,6 +803,24 @@ function App() {
     invalidate(false);
     setDraftActions((current) =>
       current.length < 16 ? [...current, action] : current,
+    );
+  }
+  function stageFact(mark: DraftFact) {
+    if (
+      busy ||
+      !identityConfirmed ||
+      !factsConfirmed ||
+      !providerConfirmed ||
+      !factState?.enabled ||
+      draftFacts.length >= 16 ||
+      Array.from(draft)
+        .slice(mark.occurrence.start, mark.occurrence.end)
+        .join("") !== mark.occurrence.quote
+    )
+      return;
+    invalidate(false);
+    setDraftFacts((current) =>
+      current.length < 16 ? [...current, mark] : current,
     );
   }
   async function cancelPrepare() {
@@ -1207,6 +1410,43 @@ function App() {
                       ))}
                     </div>
                   )}
+                  {preview.review && preview.review.items.length > 0 && (
+                    <details className="preview-decisions" open>
+                      <summary>Điều chỉnh đề xuất mới</summary>
+                      <p>
+                        Chỉ bỏ che đề xuất tự động chưa được lưu, đúng lần xuất
+                        hiện này. Quy tắc, thông tin truy cập và bảo vệ đã xác
+                        nhận không thay đổi. Lựa chọn chỉ áp dụng bản gửi này;
+                        lượt sau model có thể nhận diện lại.
+                      </p>
+                      {preview.review.items.map((item) => (
+                        <div
+                          key={item.candidate_id}
+                          className="preview-decision"
+                        >
+                          <blockquote>
+                            “{item.quote}” · ký tự {item.start + 1}–{item.end}
+                          </blockquote>
+                          <p>
+                            {item.rejected
+                              ? "Bạn đã chọn không che trong bản gửi này."
+                              : item.can_reject
+                                ? "Đề xuất tự động mới, chưa lưu."
+                                : "Giữ che: liên quan đến bảo vệ đã xác nhận, quy tắc hoặc quan hệ khác."}
+                          </p>
+                          <button
+                            type="button"
+                            disabled={busy || !item.can_reject}
+                            onClick={() =>
+                              void reviewPreview(item.candidate_id)
+                            }
+                          >
+                            Không che đề xuất này trong bản gửi này
+                          </button>
+                        </div>
+                      ))}
+                    </details>
+                  )}
                 </>
               ) : (
                 <div className="empty-preview">
@@ -1242,6 +1482,21 @@ function App() {
                 </div>
               </div>
             )}
+            {pendingReview && (
+              <div className="preview-review-pending" role="alert">
+                <p>
+                  Chưa xác nhận thay đổi bản gửi. Các thao tác khác đang tạm
+                  khóa.
+                </p>
+                <button
+                  type="button"
+                  disabled={phase === "loading"}
+                  onClick={() => void reviewPreview()}
+                >
+                  Kiểm tra lại thay đổi bản gửi
+                </button>
+              </div>
+            )}
             <FactPanel
               key={session}
               state={factState}
@@ -1256,8 +1511,10 @@ function App() {
               uncertain={!identityConfirmed}
               draftSelection={draftSelection}
               actions={draftActions}
+              factMarks={draftFacts}
               onCommand={changeIdentity}
               onStage={stageIdentity}
+              onStageFact={stageFact}
               onClearDraft={() => invalidate()}
             />
             <div className="scope-note">

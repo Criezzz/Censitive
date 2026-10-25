@@ -37,7 +37,16 @@ def _contains(outer: State, inner: State) -> bool:
 def _validate(plan: ReviewPlan, base: State) -> None:
     if type(plan) is not ReviewPlan or plan.base != base:
         raise PrivacyError("STATE_STALE")
+    if (
+        type(plan.source_id) is not str
+        or not ID.fullmatch(plan.source_id)
+        or type(plan.rejected) is not tuple
+        or any(type(value) is not str or not ID.fullmatch(value) for value in plan.rejected)
+    ):
+        raise PrivacyError("PREVIEW_DECISION_INVALID")
     for state in (base, plan.trusted, plan.proposed):
+        if type(state) is not State:
+            raise PrivacyError("PREVIEW_DECISION_INVALID")
         state.validate()
     source = plan.proposed.source(plan.source_id)
     if (
@@ -92,6 +101,8 @@ def _reason(plan: ReviewPlan, fact: Fact, literals: tuple[str, ...]) -> str:
 
 def reviewed_state(plan: ReviewPlan, base: State, literals: tuple[str, ...]) -> State:
     _validate(plan, base)
+    if type(literals) is not tuple or any(type(value) is not str for value in literals):
+        raise PrivacyError("PREVIEW_DECISION_INVALID")
     if len(set(plan.rejected)) != len(plan.rejected) or len(plan.rejected) > 128:
         raise PrivacyError("PREVIEW_DECISION_INVALID")
     for candidate in plan.rejected:

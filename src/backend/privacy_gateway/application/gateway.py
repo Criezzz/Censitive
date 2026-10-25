@@ -597,7 +597,7 @@ class Gateway:
         try:
             if type(command) is not RejectNewMask:
                 raise ValueError("invalid command")
-            command = RejectNewMask.model_validate(command.model_dump(mode="python"))
+            command = RejectNewMask.model_validate(vars(command))
         except (ValidationError, ValueError, TypeError, AttributeError):
             self.discard(session, prepared_id)
             raise PrivacyError("PREVIEW_DECISION_INVALID") from None

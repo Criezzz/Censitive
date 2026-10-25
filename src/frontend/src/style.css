@@ -1695,13 +1695,51 @@ h3 {
   color: #173440;
   padding: 1px 2px;
 }
-.identity-draft-actions {
+.identity-draft-actions,
+.fact-draft-marks {
   padding-left: 20px;
   max-height: 180px;
   overflow-y: auto;
 }
-.identity-draft-actions li {
+.identity-draft-actions li,
+.fact-draft-marks li {
   margin: 6px 0;
+}
+.preview-decisions,
+.preview-review-pending {
+  margin: 16px 0;
+  padding: 12px;
+  border: 1px solid #c9d8dd;
+  border-radius: 10px;
+  background: #f8fbfb;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.preview-review-pending {
+  margin: 16px 20px;
+}
+.preview-decisions summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+.preview-decision {
+  padding: 10px 0;
+  border-top: 1px solid #d9e4e7;
+}
+.preview-decision blockquote {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.preview-decision button,
+.preview-review-pending button {
+  max-width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #9bc5cb;
+  border-radius: 8px;
+  background: white;
+  font: inherit;
+  line-height: 1.5;
 }
 @media (max-width: 700px) {
   .semantic-example {
