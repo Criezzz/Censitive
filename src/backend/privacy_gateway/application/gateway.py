@@ -11,8 +11,6 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from pydantic import ValidationError
-
 from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_detector import SemanticDetector
 from privacy_gateway.adapters.provider import Provider, StreamingProvider, serialize_request
@@ -38,6 +36,7 @@ from privacy_gateway.domain.preview_review import (
     ReviewPlan,
     reject_new_mask,
     reviewed_state,
+    validate_review_command,
 )
 from privacy_gateway.domain.redaction import (
     PREFIX,
@@ -595,12 +594,10 @@ class Gateway:
         from privacy_gateway.domain.state_proposals import StateDelta
 
         try:
-            if type(command) is not RejectNewMask:
-                raise ValueError("invalid command")
-            command = RejectNewMask.model_validate(vars(command))
-        except (ValidationError, ValueError, TypeError, AttributeError):
+            command = validate_review_command(command)
+        except PrivacyError:
             self.discard(session, prepared_id)
-            raise PrivacyError("PREVIEW_DECISION_INVALID") from None
+            raise
         signature = hashlib.sha256(
             repr(("preview", prepared_id, expected_epoch, command.model_dump_json())).encode()
         ).hexdigest()

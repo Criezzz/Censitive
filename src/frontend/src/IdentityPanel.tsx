@@ -10,6 +10,31 @@ type Occurrence = DraftOccurrence & {
 export type DraftAction =
   | { kind: "create"; occurrence: DraftOccurrence; protect: boolean }
   | { kind: "alias"; occurrence: DraftOccurrence; entity_id: string };
+export type FactCategory =
+  "confidential" | "personal" | "health" | "financial" | "credential";
+export type DraftFact = { occurrence: DraftOccurrence; category: FactCategory };
+export type CreateFactCommand = {
+  operation_id: string;
+  command: {
+    kind: "create_fact";
+    expected_epoch: number;
+    evidence: Occurrence;
+    category: FactCategory;
+  };
+};
+export type ProtectionCommand = {
+  operation_id: string;
+  command: IdentityCommand["command"] | CreateFactCommand["command"];
+};
+export type FactResult = {
+  receipt: {
+    operation_id: string;
+    committed_epoch: number;
+    fact_id: string;
+    fact_revision: number;
+  };
+  state: FactState;
+};
 export type IdentityCommand = {
   operation_id: string;
   command:
@@ -45,6 +70,8 @@ export const identityErrors = new Set([
   "STATE_COMMAND_LIMIT",
   "STATE_LIMIT",
   "STATE_INVALID",
+  "STATE_SOURCE_MISSING",
+  "STATE_CATEGORY_INVALID",
   "INVALID_INPUT",
   "SESSION_BUSY",
 ]);
@@ -110,8 +137,10 @@ export function IdentityPanel({
   uncertain,
   draftSelection,
   actions,
+  factMarks,
   onCommand,
   onStage,
+  onStageFact,
   onClearDraft,
 }: {
   state: FactState | null;
@@ -119,18 +148,22 @@ export function IdentityPanel({
   uncertain: boolean;
   draftSelection: DraftOccurrence | null;
   actions: DraftAction[];
-  onCommand: (command: IdentityCommand) => Promise<void>;
+  factMarks: DraftFact[];
+  onCommand: (command: ProtectionCommand) => Promise<void>;
   onStage: (action: DraftAction) => void;
+  onStageFact: (mark: DraftFact) => void;
   onClearDraft: () => void;
 }) {
   const [sourceId, setSourceId] = useState("");
   const [selection, setSelection] = useState<DraftOccurrence | null>(null);
   const [entityId, setEntityId] = useState("");
   const [protect, setProtect] = useState(false);
-  const [pending, setPending] = useState<IdentityCommand | null>(null);
+  const [category, setCategory] = useState<FactCategory>("confidential");
+  const [pending, setPending] = useState<ProtectionCommand | null>(null);
   useEffect(() => {
     setSelection(null);
     setProtect(false);
+    setCategory("confidential");
   }, [state?.epoch]);
   if (!state?.enabled || !Array.isArray(state.entities)) return null;
   const sources = state.sources.filter((source) =>
@@ -149,7 +182,7 @@ export function IdentityPanel({
           source_digest: source.digest!,
         }
       : null;
-  async function submit(command?: IdentityCommand["command"]) {
+  async function submit(command?: ProtectionCommand["command"]) {
     if (busy || (!pending && (uncertain || !command))) return;
     const operation = pending ?? {
       operation_id: crypto.randomUUID().replaceAll("-", ""),
@@ -168,7 +201,7 @@ export function IdentityPanel({
   return (
     <details className="identity-panel">
       <summary>
-        Định danh và bí danh <span>{state.entities.length}</span>
+        Định danh, bí danh và fact <span>{state.entities.length}</span>
       </summary>
       <p>
         Chọn đúng lần xuất hiện. Hai người cùng tên vẫn là hai định danh riêng;
@@ -177,15 +210,17 @@ export function IdentityPanel({
       {uncertain && (
         <div role="alert">
           <p>
-            Chưa xác nhận thao tác định danh. Giữ nguyên yêu cầu để kiểm tra
-            lại; chat và các thay đổi khác đang tạm khóa.
+            Chưa xác nhận thao tác bảo vệ. Giữ nguyên yêu cầu để kiểm tra lại;
+            chat và các thay đổi khác đang tạm khóa.
           </p>
           <button
             type="button"
             disabled={busy || !pending}
             onClick={() => void submit()}
           >
-            Kiểm tra lại thao tác định danh
+            {pending?.command.kind === "create_fact"
+              ? "Kiểm tra lại thao tác bảo vệ fact"
+              : "Kiểm tra lại thao tác định danh"}
           </button>
         </div>
       )}
@@ -262,6 +297,23 @@ export function IdentityPanel({
         Tạo định danh không tự bật bảo vệ. Bật lựa chọn trên nếu muốn bảo vệ
         người hoặc đối tượng này.
       </p>
+      <label htmlFor="fact-category">Loại fact cần bảo vệ</label>
+      <select
+        id="fact-category"
+        value={category}
+        disabled={locked}
+        onChange={(event) => setCategory(event.target.value as FactCategory)}
+      >
+        <option value="confidential">Thông tin nội bộ</option>
+        <option value="personal">Thông tin cá nhân</option>
+        <option value="health">Sức khỏe</option>
+        <option value="financial">Tài chính</option>
+        <option value="credential">Thông tin truy cập — không phục hồi</option>
+      </select>
+      <p>
+        Bảo vệ fact giữ riêng đúng thông tin đã chọn; không bảo vệ mọi lần xuất
+        hiện của một tên. Không bỏ quy tắc bảo vệ đã có.
+      </p>
       <fieldset disabled={locked}>
         <legend>Từ nguồn đã lưu</legend>
         <label htmlFor="identity-source">Nguồn để chọn lần xuất hiện</label>
@@ -299,8 +351,23 @@ export function IdentityPanel({
         <p className="identity-selection">
           {selection
             ? `Đã chọn “${selection.quote}” · vị trí ${selection.start}–${selection.end}`
-            : "Bôi chọn tên hoặc bí danh trong nguồn. Không nhập lại để đoán lần xuất hiện."}
+            : "Bôi chọn tên, bí danh hoặc thông tin trong nguồn. Không nhập lại để đoán lần xuất hiện."}
         </p>
+        <button
+          type="button"
+          disabled={!occurrence}
+          onClick={() =>
+            occurrence &&
+            void submit({
+              kind: "create_fact",
+              expected_epoch: state.epoch,
+              evidence: occurrence,
+              category,
+            })
+          }
+        >
+          Bảo vệ fact từ đoạn đã chọn
+        </button>
         <button
           type="button"
           disabled={!occurrence}
@@ -346,6 +413,28 @@ export function IdentityPanel({
         </p>
         <button
           type="button"
+          disabled={!draftSelection || factMarks.length >= 16}
+          onClick={() =>
+            draftSelection &&
+            onStageFact({ occurrence: draftSelection, category })
+          }
+        >
+          Bảo vệ fact trong bản nháp
+        </button>
+        <p>{factMarks.length}/16 fact trong bản nháp; chưa lưu.</p>
+        <ol className="fact-draft-marks">
+          {factMarks.map((mark, index) => (
+            <li key={index}>
+              “{mark.occurrence.quote}” · {mark.occurrence.start}–
+              {mark.occurrence.end} ·{" "}
+              {mark.category === "credential"
+                ? "Không phục hồi"
+                : "Bảo vệ fact"}
+            </li>
+          ))}
+        </ol>
+        <button
+          type="button"
           disabled={!draftSelection || actions.length >= 16}
           onClick={() =>
             draftSelection &&
@@ -388,8 +477,12 @@ export function IdentityPanel({
             </li>
           ))}
         </ol>
-        <button type="button" disabled={!actions.length} onClick={onClearDraft}>
-          Bỏ lựa chọn định danh trong nháp
+        <button
+          type="button"
+          disabled={!actions.length && !factMarks.length}
+          onClick={onClearDraft}
+        >
+          Bỏ lựa chọn bảo vệ trong nháp
         </button>
       </fieldset>
     </details>

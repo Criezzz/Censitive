@@ -1,7 +1,7 @@
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from privacy_gateway.domain.detection import detect
 from privacy_gateway.domain.identity import DraftIdentity, verify_draft_identity
@@ -14,6 +14,15 @@ class RejectNewMask(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
     kind: Literal["reject_new_mask"]
     candidate_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+def validate_review_command(command: RejectNewMask) -> RejectNewMask:
+    try:
+        if type(command) is not RejectNewMask:
+            raise ValueError("invalid command")
+        return RejectNewMask.model_validate(vars(command))
+    except (ValidationError, ValueError, TypeError, AttributeError):
+        raise PrivacyError("PREVIEW_DECISION_INVALID") from None
 
 
 @dataclass(frozen=True)
@@ -147,14 +156,9 @@ def review_items(plan: ReviewPlan, literals: tuple[str, ...]) -> list[dict[str, 
 def reject_new_mask(
     plan: ReviewPlan, base: State, literals: tuple[str, ...], command: RejectNewMask
 ) -> tuple[ReviewPlan, State]:
+    command = validate_review_command(command)
     reviewed_state(plan, base, literals)
-    if (
-        type(command) is not RejectNewMask
-        or type(command.candidate_id) is not str
-        or not ID.fullmatch(command.candidate_id)
-        or command.kind != "reject_new_mask"
-        or command.candidate_id in plan.rejected
-    ):
+    if command.candidate_id in plan.rejected:
         raise PrivacyError("PREVIEW_DECISION_INVALID")
     updated = replace(plan, rejected=(*plan.rejected, command.candidate_id))
     return updated, reviewed_state(updated, base, literals)
