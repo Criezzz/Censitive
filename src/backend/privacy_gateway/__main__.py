@@ -7,6 +7,7 @@ from privacy_gateway.adapters.codex_provider import CodexProvider
 from privacy_gateway.adapters.connections import ProviderConnections
 from privacy_gateway.adapters.local_chat import LocalChatProvider
 from privacy_gateway.adapters.local_detector import LocalDetector
+from privacy_gateway.adapters.openai_provider import OpenAIProvider
 from privacy_gateway.adapters.state_resolver import LocalStateResolver
 from privacy_gateway.api.app import create_app
 from privacy_gateway.application.gateway import Gateway
@@ -16,14 +17,21 @@ from privacy_gateway.domain.redaction import PrivacyError
 def main() -> None:
     parser = argparse.ArgumentParser(description="Censitive privacy gateway")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--provider", choices=("demo", "codex"), default="demo")
+    parser.add_argument("--provider", choices=("demo", "codex", "openai", "local"), default="demo")
     parser.add_argument("--detector", choices=("rules", "qwen"), default="rules")
     parser.add_argument("--local-model", choices=("4b", "8b"), default="8b")
     parser.add_argument("--semantic-mode", choices=("literal", "state"), default="literal")
     args = parser.parse_args()
     if args.semantic_mode == "state" and args.detector != "qwen":
         parser.error("--semantic-mode state requires --detector qwen")
+    if args.provider == "local" and args.detector != "qwen":
+        parser.error("--provider local requires --detector qwen and its authenticated runtime")
     gateway = Gateway()
+    openai = OpenAIProvider.from_environment()
+    if args.provider == "openai":
+        if code := openai.configuration_error():
+            parser.exit(2, f"OpenAI API configuration: {code}\n")
+        gateway = Gateway(openai)
     local = None
     if args.provider == "codex":
         try:
@@ -36,13 +44,19 @@ def main() -> None:
     if args.detector == "qwen":
         runtime_lock = asyncio.Lock()
         local = LocalChatProvider(args.local_model, lock=runtime_lock)
+        if args.provider == "local":
+            if not local.key:
+                parser.exit(2, "Local chat unavailable: LOCAL_CHAT_UNAVAILABLE\n")
+            gateway = Gateway(local)
         if args.semantic_mode == "state":
             gateway.resolver = LocalStateResolver(args.local_model, lock=runtime_lock)
         else:
             gateway.detector = LocalDetector(args.local_model, lock=runtime_lock)
     uvicorn.run(
         create_app(
-            gateway, port=args.port, connections=ProviderConnections(gateway.provider, local=local)
+            gateway,
+            port=args.port,
+            connections=ProviderConnections(gateway.provider, local=local, openai=openai),
         ),
         host="127.0.0.1",
         port=args.port,

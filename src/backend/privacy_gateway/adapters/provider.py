@@ -15,15 +15,18 @@ class Provider(Protocol):
 
 
 @runtime_checkable
-class StreamingProvider(Protocol):
+class ProviderOptions(Protocol):
     @property
     def request_options(self) -> Mapping[str, object]: ...
 
+
+@runtime_checkable
+class StreamingProvider(ProviderOptions, Protocol):
     def stream(self, body: bytes) -> AsyncGenerator[str, None]: ...
 
 
 def serialize_request(provider: Provider, messages: list[dict[str, str]]) -> bytes:
-    options = dict(provider.request_options) if isinstance(provider, StreamingProvider) else {}
+    options = dict(provider.request_options) if isinstance(provider, ProviderOptions) else {}
     if options.keys() & {"model", "messages"}:
         raise PrivacyError("INVALID_PAYLOAD")
     try:

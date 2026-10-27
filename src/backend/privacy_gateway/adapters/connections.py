@@ -7,6 +7,7 @@ from pathlib import Path
 from privacy_gateway.adapters.codex_provider import CodexProvider
 from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_chat import LocalChatProvider
+from privacy_gateway.adapters.openai_provider import OpenAIProvider
 from privacy_gateway.adapters.provider import Provider
 from privacy_gateway.domain.redaction import PrivacyError
 
@@ -27,6 +28,7 @@ class ProviderConnections:
         codex_factory: Callable[[], CodexProvider] = CodexProvider,
         *,
         local: LocalChatProvider | None = None,
+        openai: OpenAIProvider | None = None,
     ) -> None:
         self.demo: Provider = default if default.provider_id == "local-demo" else FakeProvider()
         self.codex = default if isinstance(default, CodexProvider) else None
@@ -37,6 +39,7 @@ class ProviderConnections:
         self.login_task: asyncio.Task[None] | None = None
         self.login_owner = ""
         self.local = local
+        self.openai = default if isinstance(default, OpenAIProvider) else openai
 
     def catalog(self) -> list[dict[str, object]]:
         catalog: list[dict[str, object]] = [
@@ -69,6 +72,18 @@ class ProviderConnections:
                     "streaming": True,
                 }
             )
+        code = self.openai.configuration_error() if self.openai else "OPENAI_API_KEY_REQUIRED"
+        catalog.append(
+            {
+                "id": "openai-api",
+                "name": "OpenAI API",
+                "model": self.openai.model if self.openai else "",
+                "auth": "api-key",
+                "status": "unavailable" if code else "configured",
+                "code": code,
+                "streaming": False,
+            }
+        )
         return catalog
 
     def _load(self) -> CodexProvider:
@@ -99,6 +114,15 @@ class ProviderConnections:
                 self.status, self.code = "ready", ""
 
     async def resolve(self, provider_id: str, model: str) -> Provider:
+        if provider_id == "openai-api":
+            if self.openai is None:
+                raise PrivacyError("OPENAI_API_KEY_REQUIRED")
+            code = self.openai.configuration_error()
+            if code:
+                raise PrivacyError(code)
+            if model != self.openai.model:
+                raise PrivacyError("UNKNOWN_PROVIDER_MODEL")
+            return self.openai
         if (
             self.local is not None
             and provider_id == self.local.provider_id

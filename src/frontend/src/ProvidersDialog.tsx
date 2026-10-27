@@ -1,131 +1,23 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useProviderConnections,
+  type ProviderDialogProps,
+} from "./controllers/useProviderConnections";
+import { connectionMessages } from "./data/providers";
 
-type ProviderChoice = {
-  id: string;
-  name: string;
-  model: string;
-  auth: string;
-  status: string;
-  code: string;
-};
-type Catalog = { providers: ProviderChoice[] };
-type Request = <T>(path: string, method?: string, body?: unknown) => Promise<T>;
-
-const messages: Record<string, string> = {
-  CODEX_NOT_FOUND:
-    "Chưa tìm thấy Codex CLI trên máy. Cài Codex rồi kiểm tra lại.",
-  CODEX_VERSION_UNVERIFIED:
-    "Bản Codex này chưa được kiểm chứng với gateway. Kết nối đang bị khóa.",
-  CODEX_CHATGPT_LOGIN_REQUIRED: "Chưa có phiên đăng nhập ChatGPT trong Codex.",
-  CODEX_LOGIN_FAILED:
-    "Đăng nhập chưa hoàn tất. Thử lại hoặc dùng lệnh bên dưới.",
-  CODEX_LOGIN_TIMEOUT:
-    "Đã hết thời gian chờ đăng nhập. Bạn có thể bắt đầu lại.",
-  CODEX_LOGIN_CANCELLED:
-    "Đã dừng chờ đăng nhập. Tài khoản đã đăng nhập trước đó không bị đăng xuất.",
-  LOGIN_BUSY: "Một cửa sổ khác đang đăng nhập Codex. Hãy chờ rồi kiểm tra lại.",
-  SESSION_BUSY: "Hãy chờ lượt chat kết thúc trước khi đổi provider.",
-  SESSION_CHANGED:
-    "Phiên đã thay đổi trong lúc kiểm tra kết nối. Hãy đóng hộp này rồi kiểm tra lại.",
-  AUTH_REQUIRED:
-    "Kết nối ứng dụng đã hết hiệu lực. Đóng hộp này và tạo phiên mới.",
-};
-
-export function ProvidersDialog({
-  current,
-  request,
-  onApply,
-  onClose,
-}: {
-  current: string;
-  request: Request;
-  onApply: (provider: string, model: string) => Promise<void>;
-  onClose: () => void;
-}) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  const [providers, setProviders] = useState<ProviderChoice[]>([]);
-  const [selected, setSelected] = useState(current);
-  const [working, setWorking] = useState(false);
-  const [error, setError] = useState("");
-  const chosen = providers.find((p) => p.id === selected);
-  const signingIn = providers.some((p) => p.status === "signing_in");
-
-  useEffect(() => {
-    const element = dialog.current!;
-    element.showModal();
-    let active = true;
-    request<Catalog>("/providers")
-      .then((result) => {
-        if (active) setProviders(result.providers);
-      })
-      .catch(() => {
-        if (active) setError("Không thể tải danh sách provider.");
-      });
-    return () => {
-      active = false;
-      element.close();
-    };
-  }, [request]);
-
-  useEffect(() => {
-    if (!signingIn || working) return;
-    let active = true;
-    let pending = false;
-    const timer = window.setInterval(() => {
-      if (pending) return;
-      pending = true;
-      request<Catalog>("/providers")
-        .then((result) => {
-          if (active) setProviders(result.providers);
-        })
-        .catch(() => {
-          if (active) setError("Mất kết nối ứng dụng. Hãy kiểm tra lại.");
-        })
-        .finally(() => {
-          pending = false;
-        });
-    }, 2000);
-    return () => {
-      active = false;
-      window.clearInterval(timer);
-    };
-  }, [signingIn, working, request]);
-
-  async function action(path: string) {
-    if (working) return;
-    setWorking(true);
-    setError("");
-    try {
-      const result = await request<Catalog>(path, "POST");
-      setProviders(result.providers);
-    } catch (reason) {
-      const code = reason instanceof Error ? reason.message : "";
-      setError(
-        messages[code] ?? "Không thể kết nối provider. Hãy thử kiểm tra lại.",
-      );
-    } finally {
-      setWorking(false);
-    }
-  }
-
-  async function apply() {
-    if (!chosen || working || chosen.status !== "ready") return;
-    setWorking(true);
-    setError("");
-    try {
-      await onApply(chosen.id, chosen.model);
-      onClose();
-    } catch (reason) {
-      const code = reason instanceof Error ? reason.message : "";
-      setError(
-        messages[code] ??
-          "Chưa xác nhận được kết quả đổi provider. Hãy thử lại để xác nhận đích nhận trước khi gửi.",
-      );
-    } finally {
-      setWorking(false);
-    }
-  }
-
+export function ProvidersDialog(props: ProviderDialogProps) {
+  const { current, onClose } = props;
+  const {
+    dialog,
+    providers,
+    selected,
+    working,
+    error,
+    chosen,
+    canSelect,
+    action,
+    apply,
+    selectChoice,
+  } = useProviderConnections(props);
   return (
     <dialog
       ref={dialog}
@@ -165,10 +57,7 @@ export function ProvidersDialog({
               }
               aria-pressed={selected === p.id}
               disabled={working}
-              onClick={() => {
-                setSelected(p.id);
-                setError("");
-              }}
+              onClick={() => selectChoice(p.id)}
             >
               <span className="provider-symbol">
                 {p.id === "local-demo" ? "◇" : "⌘"}
@@ -180,7 +69,9 @@ export function ProvidersDialog({
                     ? "Không cần tài khoản"
                     : p.id === "local-qwen"
                       ? "Mô hình chạy trên máy"
-                      : "Tài khoản ChatGPT · cloud"}
+                      : p.id === "openai-api"
+                        ? "API key · cloud"
+                        : "Tài khoản ChatGPT · cloud"}
                 </small>
               </span>
               {current === p.id && (
@@ -203,6 +94,23 @@ export function ProvidersDialog({
                 Dùng chung runtime với bộ phát hiện; không gửi hội thoại lên
                 cloud.
               </p>
+            ) : chosen.id === "openai-api" ? (
+              <>
+                <p>
+                  Gọi OpenAI trực tiếp bằng API key của backend, sau khi bạn
+                  duyệt nội dung đã che. Không dùng phiên đăng nhập
+                  ChatGPT/Codex.
+                </p>
+                <p role="status">
+                  {chosen.status === "configured"
+                    ? "Đã có cấu hình key và model. Chưa xác minh bằng lượt gọi thật."
+                    : "Chưa có cấu hình API hợp lệ. Đặt OPENAI_API_KEY và CENSITIVE_OPENAI_MODEL cho backend, rồi khởi động lại."}
+                </p>
+                <p>
+                  Key không được gửi tới trình duyệt. Quyền dùng model, hạn mức
+                  và chi phí do tài khoản OpenAI API của bạn quyết định.
+                </p>
+              </>
             ) : (
               <>
                 <label htmlFor="auth-method">Cách kết nối</label>
@@ -231,7 +139,7 @@ export function ProvidersDialog({
                         ? "Đang chờ bạn đăng nhập trên trình duyệt…"
                         : chosen.status === "unchecked"
                           ? "Chưa kiểm tra kết nối trên máy"
-                          : (messages[chosen.code] ??
+                          : (connectionMessages[chosen.code] ??
                             "Kết nối hiện chưa sẵn sàng.")}
                 </div>
                 <div className="connection-actions">
@@ -300,7 +208,11 @@ export function ProvidersDialog({
             <small className="model-note">
               {chosen.id === "local-demo"
                 ? "Bộ phản hồi mẫu"
-                : "Model đã được kiểm chứng cho tích hợp hiện tại"}
+                : chosen.id === "openai-api"
+                  ? "Model được cấu hình ở backend; chưa kiểm chứng bằng API thật"
+                  : chosen.id === "codex-chatgpt"
+                    ? "Model từng được kiểm chứng cho tích hợp; vẫn cần kiểm tra kết nối hiện tại"
+                    : "Model đã được kiểm chứng cho tích hợp hiện tại"}
             </small>
           </section>
         )}
@@ -317,7 +229,7 @@ export function ProvidersDialog({
         </p>
         <button
           className="primary"
-          disabled={!chosen || working || chosen.status !== "ready"}
+          disabled={!chosen || working || !canSelect}
           onClick={() => void apply()}
         >
           Dùng cho hội thoại này

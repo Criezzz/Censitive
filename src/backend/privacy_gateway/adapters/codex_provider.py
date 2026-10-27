@@ -10,7 +10,7 @@ from typing import Any
 
 from privacy_gateway.domain.redaction import PrivacyError
 
-CLI_SHA256 = "2271526227b06ca13ab2b975b88546460fc61b2a29225b6dda0fdc803024ccc9"
+CLI_SHA256 = "589f2546cc1e86703da326b00741f8b7a58fd182a1a90499faa0beebf22a24e2"
 INSTRUCTIONS = (
     "You answer a text conversation supplied as a JSON object with model and messages. "
     "Answer the last user message using that conversation's context. Reply in the user's "

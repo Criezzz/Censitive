@@ -1,135 +1,14 @@
-import { useEffect, useState } from "react";
-import type { FactState } from "./FactPanel";
-
-export type DraftOccurrence = { start: number; end: number; quote: string };
-type Occurrence = DraftOccurrence & {
-  source_id: string;
-  source_revision: number;
-  source_digest: string;
-};
-export type DraftAction =
-  | { kind: "create"; occurrence: DraftOccurrence; protect: boolean }
-  | { kind: "alias"; occurrence: DraftOccurrence; entity_id: string };
-export type FactCategory =
-  "confidential" | "personal" | "health" | "financial" | "credential";
-export type DraftFact = { occurrence: DraftOccurrence; category: FactCategory };
-export type CreateFactCommand = {
-  operation_id: string;
-  command: {
-    kind: "create_fact";
-    expected_epoch: number;
-    evidence: Occurrence;
-    category: FactCategory;
-  };
-};
-export type ProtectionCommand = {
-  operation_id: string;
-  command: IdentityCommand["command"] | CreateFactCommand["command"];
-};
-export type FactResult = {
-  receipt: {
-    operation_id: string;
-    committed_epoch: number;
-    fact_id: string;
-    fact_revision: number;
-  };
-  state: FactState;
-};
-export type IdentityCommand = {
-  operation_id: string;
-  command:
-    | {
-        kind: "create";
-        expected_epoch: number;
-        evidence: Occurrence;
-        protect: boolean;
-      }
-    | { kind: "protect"; expected_epoch: number; entity_id: string }
-    | {
-        kind: "alias";
-        expected_epoch: number;
-        entity_id: string;
-        mention: Occurrence;
-      };
-};
-export type IdentityResult = {
-  receipt: {
-    operation_id: string;
-    committed_epoch: number;
-    entity_id: string;
-    policy_fact_id: string | null;
-  };
-  state: FactState;
-};
-export const identityErrors = new Set([
-  "STATE_STALE",
-  "STATE_ENTITY_MISSING",
-  "STATE_EVIDENCE_MISMATCH",
-  "STATE_AMBIGUOUS_LINK",
-  "STATE_COMMAND_CONFLICT",
-  "STATE_COMMAND_LIMIT",
-  "STATE_LIMIT",
-  "STATE_INVALID",
-  "STATE_SOURCE_MISSING",
-  "STATE_CATEGORY_INVALID",
-  "INVALID_INPUT",
-  "SESSION_BUSY",
-]);
-
-function occurrenceContext(
-  state: FactState,
-  item: {
-    value: string;
-    source_id: string;
-    source_revision?: number;
-    start?: number;
-    end?: number;
-  },
-) {
-  const source = state.sources.find(
-    (candidate) => candidate.id === item.source_id,
-  );
-  if (
-    !source ||
-    source.revision !== item.source_revision ||
-    typeof item.start !== "number" ||
-    typeof item.end !== "number" ||
-    !Number.isInteger(item.start) ||
-    !Number.isInteger(item.end)
-  )
-    return null;
-  const chars = Array.from(source.text);
-  if (
-    item.start < 0 ||
-    item.end <= item.start ||
-    item.end > chars.length ||
-    chars.slice(item.start, item.end).join("") !== item.value
-  )
-    return null;
-  return {
-    before: chars.slice(Math.max(0, item.start - 20), item.start).join(""),
-    after: chars.slice(item.end, item.end + 20).join(""),
-    sourceNumber: state.sources.indexOf(source) + 1,
-    start: item.start + 1,
-    end: item.end,
-  };
-}
-
-export function selectedOccurrence(
-  text: string,
-  start: number,
-  end: number,
-): DraftOccurrence | null {
-  if (start >= end || start < 0 || end > text.length) return null;
-  const boundaries = [0];
-  for (const character of text)
-    boundaries.push(boundaries.at(-1)! + character.length);
-  const a = boundaries.indexOf(start),
-    b = boundaries.indexOf(end);
-  const quote = text.slice(start, end);
-  if (a < 0 || b < 0 || !quote.trim() || b - a > 800) return null;
-  return { start: a, end: b, quote };
-}
+import { useState, useEffect } from "react";
+import type {
+  FactState,
+  DraftOccurrence,
+  DraftAction,
+  DraftFact,
+  FactCategory,
+  ProtectionCommand,
+} from "./data/contracts";
+import { identityErrors } from "./data/errors";
+import { selectedOccurrence, occurrenceContext } from "./data/occurrences";
 
 export function IdentityPanel({
   state,

@@ -1,51 +1,6 @@
 import { useState } from "react";
-
-export type FactState = {
-  enabled: boolean;
-  epoch: number;
-  facts: {
-    id: string;
-    revision: number;
-    value: string;
-    category: string;
-    scope: string;
-    superseded: boolean;
-    source_id: string;
-  }[];
-  sources: { id: string; revision: number; text: string; digest?: string }[];
-  entities?: {
-    id: string;
-    value: string;
-    source_id: string;
-    source_revision?: number;
-    start?: number;
-    end?: number;
-    protected: boolean;
-    aliases: {
-      value: string;
-      source_id: string;
-      source_revision?: number;
-      start?: number;
-      end?: number;
-    }[];
-  }[];
-};
-export type Correction = {
-  operation_id: string;
-  fact_id: string;
-  expected_revision: number;
-  expected_epoch: number;
-  text: string;
-};
-export const correctionErrors = new Set([
-  "STATE_STALE",
-  "STATE_IDENTITY_REVIEW_REQUIRED",
-  "STATE_COMMAND_CONFLICT",
-  "STATE_COMMAND_LIMIT",
-  "STATE_LIMIT",
-  "INVALID_INPUT",
-  "SESSION_BUSY",
-]);
+import type { FactState, Correction } from "./data/contracts";
+import { correctionErrors } from "./data/errors";
 
 export function FactPanel({
   state,
