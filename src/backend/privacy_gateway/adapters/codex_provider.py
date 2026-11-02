@@ -5,12 +5,14 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from privacy_gateway.domain.redaction import PrivacyError
+from privacy_gateway.domain.serialization import strict_json
 
-CLI_SHA256 = "589f2546cc1e86703da326b00741f8b7a58fd182a1a90499faa0beebf22a24e2"
+CLI_SHA256 = "c057fc84bb0d76fc6710e3c82b88ae47464239bd41db89b9b84cc6bbac3265bb"
 INSTRUCTIONS = (
     "You answer a text conversation supplied as a JSON object with model and messages. "
     "Answer the last user message using that conversation's context. Reply in the user's "
@@ -57,11 +59,37 @@ class CodexProvider:
     serializer_version = "codex-stdin-v1"
     timeout = 120.0
 
-    def __init__(self, executable: str | None = None) -> None:
+    def __init__(
+        self,
+        executable: str | None = None,
+        *,
+        output_schema: Mapping[str, Any] | None = None,
+    ) -> None:
         found = executable or shutil.which("codex")
         if not found:
             raise PrivacyError("CODEX_NOT_FOUND")
         self.executable = str(Path(found).resolve())
+        self._output_schema_json: str | None = None
+        self.output_schema_sha256: str | None = None
+        if output_schema is not None:
+            if not isinstance(output_schema, Mapping):
+                raise PrivacyError("CODEX_OUTPUT_SCHEMA_INVALID")
+            try:
+                serialized = json.dumps(
+                    dict(output_schema),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                parsed = json.loads(serialized)
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                raise PrivacyError("CODEX_OUTPUT_SCHEMA_INVALID") from None
+            if type(parsed) is not dict:
+                raise PrivacyError("CODEX_OUTPUT_SCHEMA_INVALID")
+            self._output_schema_json = serialized
+            self.output_schema_sha256 = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+            self.serializer_version = f"codex-stdin-v1-schema-{self.output_schema_sha256}"
         self._verify_binary()
         self._busy = False
         allowed = {"systemroot", "windir", "userprofile", "appdata", "localappdata", "temp", "tmp"}
@@ -77,9 +105,34 @@ class CodexProvider:
         )
         catalog = json.loads(result.stdout)
         model = next(m for m in catalog["models"] if m["slug"] == self.model)
+        model["shell_type"] = "unified_exec"
+        model.pop("web_search_tool_type", None)
+        model["supports_search_tool"] = False
+        model.pop("tool_mode", None)
+        model.pop("multi_agent_version", None)
+        model["include_skills_usage_instructions"] = False
+        model["include_plugin_usage_instructions"] = False
+        model["include_apps_usage_instructions"] = False
+        model["base_instructions"] = ""
         model["apply_patch_tool_type"] = None
         model["experimental_supported_tools"] = []
         self.catalog = json.dumps({"models": [model]})
+
+    @property
+    def request_options(self) -> Mapping[str, object]:
+        if self._output_schema_json is None or self.output_schema_sha256 is None:
+            return {}
+        return {
+            "codex_output_schema": json.loads(self._output_schema_json),
+            "codex_output_schema_sha256": self.output_schema_sha256,
+        }
+
+    @property
+    def output_schema(self) -> Mapping[str, Any] | None:
+        if self._output_schema_json is None:
+            return None
+        result: dict[str, Any] = json.loads(self._output_schema_json)
+        return result
 
     def _verify_binary(self) -> None:
         with Path(self.executable).open("rb") as handle:
@@ -150,6 +203,12 @@ class CodexProvider:
             str(directory),
             "-m",
             self.model,
+        ]
+        if self._output_schema_json is not None:
+            schema_path = directory / "output_schema.json"
+            schema_path.write_text(self._output_schema_json + "\n", encoding="utf-8")
+            command += ["--output-schema", str(schema_path)]
+        command += [
             "--output-last-message",
             str(directory / "answer.txt"),
         ]
@@ -160,11 +219,36 @@ class CodexProvider:
             command += ["-c", key + "=" + toml(value)]
         return command + ["-"]
 
+    def _validate_body(self, body: bytes) -> None:
+        try:
+            payload = strict_json(body)
+        except PrivacyError:
+            raise PrivacyError("INVALID_PAYLOAD") from None
+        options = dict(self.request_options)
+        if (
+            type(payload) is not dict
+            or set(payload) != {"model", "messages", *options}
+            or payload.get("model") != self.model
+            or not isinstance(payload.get("messages"), list)
+            or not 1 <= len(payload["messages"]) <= 40
+            or any(
+                type(message) is not dict
+                or set(message) != {"role", "content"}
+                or not isinstance(message.get("role"), str)
+                or message.get("role") not in {"user", "assistant"}
+                or not isinstance(message.get("content"), str)
+                for message in payload["messages"]
+            )
+            or any(payload[key] != value for key, value in options.items())
+        ):
+            raise PrivacyError("INVALID_PAYLOAD")
+
     async def complete(self, body: bytes) -> str:
         if self._busy:
             raise PrivacyError("PROVIDER_BUSY")
         self._busy = True
         try:
+            self._validate_body(body)
             await asyncio.to_thread(self._verify_binary)
             await asyncio.to_thread(self.check_login)
             with tempfile.TemporaryDirectory(prefix="censitive-codex-") as folder:

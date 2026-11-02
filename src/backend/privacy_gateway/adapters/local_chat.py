@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import AsyncGenerator, Mapping
@@ -17,14 +18,38 @@ class LocalChatProvider:
     serializer_version = "llama-sse-v1"
     timeout = 180.0
 
-    def __init__(self, profile: str = "8b", *, key: str | None = None, lock: asyncio.Lock) -> None:
+    def __init__(
+        self,
+        profile: str = "8b",
+        *,
+        key: str | None = None,
+        lock: asyncio.Lock,
+        output_schema: Mapping[str, object] | None = None,
+    ) -> None:
         self.model = model_profile(profile).model_id
         self.key = os.environ.get("CENSITIVE_LOCAL_KEY", "") if key is None else key
         self.lock = lock
+        self._output_schema_json: str | None = None
+        if output_schema is not None:
+            try:
+                if not isinstance(output_schema, Mapping):
+                    raise ValueError
+                encoded = json.dumps(
+                    dict(output_schema),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                raise PrivacyError("LOCAL_OUTPUT_SCHEMA_INVALID") from None
+            self._output_schema_json = encoded
+            self.serializer_version = f"llama-sse-v1-schema-{digest}"
 
     @property
     def request_options(self) -> Mapping[str, object]:
-        return {
+        options: dict[str, object] = {
             "stream": True,
             "cache_prompt": False,
             "chat_template_kwargs": {"enable_thinking": False},
@@ -32,6 +57,16 @@ class LocalChatProvider:
             "seed": 17,
             "max_tokens": 512,
         }
+        if self._output_schema_json is not None:
+            options["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "public_plan",
+                    "strict": True,
+                    "schema": json.loads(self._output_schema_json),
+                },
+            }
+        return options
 
     async def complete(self, body: bytes) -> str:
         pieces = []

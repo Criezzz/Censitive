@@ -18,6 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.types import Receive, Scope, Send
 
 from privacy_gateway.adapters.connections import ProviderConnections
+from privacy_gateway.adapters.conversation_store import (
+    ConversationStoreError,
+    EncryptedConversationStore,
+)
 from privacy_gateway.adapters.provider import StreamingProvider
 from privacy_gateway.application.gateway import Gateway, Prepared, Session
 from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand
@@ -150,22 +154,47 @@ class CreateSessionInput(StrictInput):
     model: str | None = Field(default=None, min_length=1, max_length=100)
 
 
+class TitleInput(StrictInput):
+    title: str = Field(min_length=1, max_length=120)
+
+
 def create_app(
     gateway: Gateway | None = None,
     port: int = 8765,
     connections: ProviderConnections | None = None,
+    conversation_store: EncryptedConversationStore | None = None,
 ) -> FastAPI:
     service = gateway or Gateway()
     connections = connections or ProviderConnections(service.provider)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        await connections.close()
+        try:
+            yield
+        finally:
+            await connections.close()
+            if conversation_store is not None:
+                conversation_store.close()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.gateway = service
     clients: dict[str, str] = {}
+    known_owners: set[str] = set()
+    if conversation_store is not None:
+        saved_owners = conversation_store.get("auth", "owners")
+        if saved_owners is not None:
+            entries = saved_owners.data.get("owners")
+            if (
+                set(saved_owners.data) != {"owners"}
+                or not isinstance(entries, list)
+                or len(entries) > 200
+                or any(
+                    not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
+                    for item in entries
+                )
+            ):
+                raise PrivacyError("STORAGE_INVALID")
+            known_owners = {item for item in entries if isinstance(item, str)}
     hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
     origins = {f"http://{host}" for host in hosts}
 
@@ -260,6 +289,10 @@ def create_app(
                 session.record("reject", str(error))
         return JSONResponse({"code": str(error)}, status_code=409)
 
+    @app.exception_handler(ConversationStoreError)
+    async def storage_error(_: Request, error: ConversationStoreError) -> JSONResponse:
+        return JSONResponse({"code": "STORAGE_UNAVAILABLE"}, status_code=503)
+
     @app.exception_handler(SpanValidationError)
     async def span_error(_: Request, error: SpanValidationError) -> JSONResponse:
         return JSONResponse({"code": error.code.value}, status_code=422)
@@ -294,9 +327,15 @@ def create_app(
     async def bootstrap(request: Request) -> JSONResponse:
         value = request.cookies.get("censitive_owner", "")
         if value not in clients:
-            if len(clients) >= 200:
-                raise PrivacyError("CLIENT_LIMIT")
-            value = secrets.token_hex(32)
+            if value not in known_owners:
+                if len(clients) >= 200 or len(known_owners) >= 200:
+                    raise PrivacyError("CLIENT_LIMIT")
+                value = secrets.token_hex(32)
+                if conversation_store is not None:
+                    conversation_store.put(
+                        "auth", "owners", {"owners": [item for item in sorted(known_owners | {value})]}
+                    )
+                    known_owners.add(value)
             clients[value] = secrets.token_hex(32)
         response = JSONResponse(
             {
@@ -310,9 +349,17 @@ def create_app(
                 if service.resolver
                 else (service.detector.model if service.detector else "rules"),
                 "state_enabled": service.resolver is not None,
+                "persistence_enabled": conversation_store is not None,
             }
         )
-        response.set_cookie("censitive_owner", value, httponly=True, samesite="strict", path="/")
+        response.set_cookie(
+            "censitive_owner",
+            value,
+            httponly=True,
+            samesite="strict",
+            path="/",
+            max_age=365 * 24 * 60 * 60 if conversation_store is not None else None,
+        )
         return response
 
     @app.post("/api/sessions")
@@ -321,9 +368,31 @@ def create_app(
         selected = service.provider
         if data.provider is not None or data.model is not None:
             selected = await connections.resolve(data.provider or "", data.model or "")
-        session = service.create_session(client_owner)
-        session.provider = selected
+        session = service.create_session(client_owner, selected)
         return {"id": session.id, "provider": selected.provider_id, "model": selected.model}
+
+    @app.get("/api/sessions")
+    async def list_sessions(request: Request) -> dict[str, object]:
+        return {
+            "sessions": [
+                {
+                    "id": session.id,
+                    "title": session.title,
+                    "provider": session.provider.provider_id,
+                    "model": session.provider.model,
+                    "message_count": len(session.private_history),
+                    "provider_confirmed": session.provider_confirmed,
+                    "recovery_status": session.recovery_status,
+                }
+                for session in service.list_sessions(owner(request))
+            ]
+        }
+
+    @app.post("/api/sessions/{session_id}/title")
+    async def rename_session(session_id: str, data: TitleInput, request: Request) -> dict[str, str]:
+        session = service.session(session_id, owner(request))
+        service.rename_session(session, data.title)
+        return {"id": session.id, "title": session.title}
 
     @app.get("/api/providers")
     async def providers(request: Request) -> dict[str, object]:
@@ -368,6 +437,9 @@ def create_app(
         session = service.session(session_id, owner(request))
         return {
             "id": session.id,
+            "title": session.title,
+            "provider_confirmed": session.provider_confirmed,
+            "recovery_status": session.recovery_status,
             "provider": session.provider.provider_id,
             "model": session.provider.model,
             "messages": [

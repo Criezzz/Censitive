@@ -14,6 +14,13 @@ from typing import TYPE_CHECKING
 from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_detector import SemanticDetector
 from privacy_gateway.adapters.provider import Provider, StreamingProvider, serialize_request
+from privacy_gateway.application.session_records import (
+    ProviderRecord,
+    SendMarkerRecord,
+    SessionStore,
+    decode_record,
+    session_record,
+)
 from privacy_gateway.domain.detection import Detection, credential_detections, detect
 from privacy_gateway.domain.identity import (
     DraftIdentity,
@@ -127,6 +134,12 @@ class Session:
     compiled_sources: tuple[CompiledSource, ...] = ()
     literal_policies: tuple[str, ...] = ()
     commands: dict[str, CommandReceipt] = field(default_factory=dict)
+    title: str = ""
+    provider_confirmed: bool = True
+    recovery_status: str = "none"
+    processing_mode: str = "rules"
+    send_marker: SendMarkerRecord | None = None
+    persistence_failed: bool = False
 
     @property
     def busy(self) -> bool:
@@ -144,31 +157,151 @@ class Gateway:
         detector: SemanticDetector | None = None,
         *,
         resolver: StateResolver | None = None,
+        store: SessionStore | None = None,
     ) -> None:
         self.sessions: dict[str, Session] = {}
         self.provider = provider or FakeProvider()
         self.detector = detector
         self.resolver = resolver
+        self.store = store
 
-    def create_session(self, owner: str) -> Session:
-        if len(self.sessions) >= 100:
-            raise PrivacyError("SESSION_LIMIT")
-        session = Session(secrets.token_hex(16), owner, provider=self.provider)
+    def _ensure_writable(self, session: Session, *, allow_unknown: bool = False) -> None:
+        if session.persistence_failed:
+            raise PrivacyError("STORAGE_UNAVAILABLE")
+        if session.recovery_status == "unknown_send" and not allow_unknown:
+            raise PrivacyError("SEND_OUTCOME_UNKNOWN")
+
+    def _persist(self, session: Session) -> None:
+        if self.store is None:
+            return
+        if session.persistence_failed:
+            raise PrivacyError("STORAGE_UNAVAILABLE")
+        try:
+            self.store.save(session_record(session))
+        except Exception:
+            session.persistence_failed = True
+            session.recovery_status = "storage_failed"
+            raise PrivacyError("STORAGE_UNAVAILABLE") from None
+
+    @staticmethod
+    def _unavailable_provider(identity: ProviderRecord) -> Provider:
+        class UnavailableProvider:
+            provider_id = identity.provider_id
+            model = identity.model
+            serializer_version = identity.serializer_version
+            timeout = 0.0
+            request_options: Mapping[str, object] = {}
+
+            async def complete(self, body: bytes) -> str:
+                raise PrivacyError("PROVIDER_UNAVAILABLE")
+
+        return UnavailableProvider()
+
+    def _restore(self, raw: object, owner: str) -> Session:
+        record = decode_record(raw)  # type: ignore[arg-type]
+        if not secrets.compare_digest(record.owner, owner):
+            raise PrivacyError("SESSION_NOT_FOUND")
+        provider = self._unavailable_provider(record.provider)
+        session = Session(record.id, record.owner, provider=provider)
+        session.title = record.title
+        session.version = record.version
+        session.provider_confirmed = False
+        session.processing_mode = record.processing_mode
+        session.private_history = [
+            Message(item.role, item.content, item.provider, item.source_id)
+            for item in record.private_history
+        ]
+        session.provider_history = [
+            Message(item.role, item.content, item.provider, item.source_id)
+            for item in record.provider_history
+        ]
+        session.vault = {item.token: item.to_domain() for item in record.vault}
+        session.state = record.state.to_domain()
+        session.commands = {key: item.to_domain() for key, item in record.commands.items()}
+        session.terms = tuple(record.terms)
+        session.literal_policies = tuple(record.literal_policies)
+        session.send_marker = record.send_marker
+        session.recovery_status = (
+            "unknown_send" if record.send_marker is not None else "provider_unavailable"
+        )
+        session.compiled_sources = ()
         self.sessions[session.id] = session
         return session
 
+    def create_session(self, owner: str, provider: Provider | None = None) -> Session:
+        if len(self.sessions) >= 100:
+            raise PrivacyError("SESSION_LIMIT")
+        selected = provider or self.provider
+        session = Session(secrets.token_hex(16), owner, provider=selected)
+        self.sessions[session.id] = session
+        try:
+            self._persist(session)
+        except PrivacyError:
+            self.sessions.pop(session.id, None)
+            raise
+        return session
+
     def select_provider(self, session: Session, provider: Provider) -> None:
-        self.discard(session)
+        self._ensure_writable(session, allow_unknown=True)
+        self.discard(session, allow_unknown=True)
         session.provider = provider
+        session.provider_confirmed = True
+        if session.recovery_status == "provider_unavailable":
+            session.recovery_status = "none"
         session.record("provider_selected", provider.provider_id)
+        self._persist(session)
 
     def session(self, session_id: str, owner: str) -> Session:
         session = self.sessions.get(session_id)
+        if session is None and self.store is not None:
+            try:
+                raw = self.store.load(owner, session_id)
+            except Exception:
+                raise PrivacyError("STORAGE_UNAVAILABLE") from None
+            if raw is not None:
+                session = self._restore(raw, owner)
         if session is None or session.closed or not secrets.compare_digest(session.owner, owner):
             raise PrivacyError("SESSION_NOT_FOUND")
         return session
 
-    def discard(self, session: Session, prepared_id: str | None = None) -> None:
+    def list_sessions(self, owner: str) -> list[Session]:
+        if self.store is None:
+            return [
+                item
+                for item in self.sessions.values()
+                if not item.closed and secrets.compare_digest(item.owner, owner)
+            ]
+        try:
+            rows = self.store.list(owner)
+        except Exception:
+            raise PrivacyError("STORAGE_UNAVAILABLE") from None
+        result: list[Session] = []
+        for raw in rows:
+            item = decode_record(raw)
+            if secrets.compare_digest(item.owner, owner):
+                cached = self.sessions.get(item.id)
+                if cached is not None and not cached.closed:
+                    result.append(cached)
+                else:
+                    result.append(self._restore(item, owner))
+        return result
+
+    def rename_session(self, session: Session, title: str) -> None:
+        self._ensure_writable(session)
+        if type(title) is not str or not title.strip() or len(title) > 120:
+            raise PrivacyError("INVALID_TITLE")
+        try:
+            title.encode("utf-8")
+        except UnicodeError:
+            raise PrivacyError("INVALID_TITLE") from None
+        session.title = title.strip()
+        session.version += 1
+        self._persist(session)
+
+    def discard(
+        self, session: Session, prepared_id: str | None = None, *, allow_unknown: bool = False
+    ) -> None:
+        self._ensure_writable(session, allow_unknown=allow_unknown)
         if prepared_id is not None and (
             session.prepared is None or session.prepared.id != prepared_id
         ):
@@ -177,6 +310,7 @@ class Gateway:
             raise PrivacyError("SESSION_BUSY")
         session.prepared = None
         session.version += 1
+        self._persist(session)
 
     def _sanitize(
         self,
@@ -276,6 +410,11 @@ class Gateway:
         draft_identity: DraftIdentity | None = None,
         draft_facts: DraftFacts | None = None,
     ) -> Prepared:
+        self._ensure_writable(session)
+        if not session.provider_confirmed:
+            raise PrivacyError("PROVIDER_UNAVAILABLE")
+        if session.processing_mode == "semantic" and self.resolver is None:
+            raise PrivacyError("STATE_DISABLED")
         if (draft_identity is not None or draft_facts is not None) and self.resolver is None:
             self.discard(session)
             raise PrivacyError("STATE_DISABLED")
@@ -389,6 +528,8 @@ class Gateway:
         if operation_id is not None:
             session.commands[operation_id] = CommandReceipt(signature, state.epoch)
         session.record("fact_corrected", "committed_locally")
+        session.processing_mode = "semantic"
+        self._persist(session)
 
     def identity_command(
         self, session: Session, command: IdentityCommand, operation_id: str
@@ -419,6 +560,8 @@ class Gateway:
         session.state = result.state
         session.commands[operation_id] = receipt
         session.record("identity_" + command.kind, "committed_locally")
+        session.processing_mode = "semantic"
+        self._persist(session)
         return receipt
 
     def create_fact(
@@ -452,6 +595,8 @@ class Gateway:
         session.state = result.state
         session.commands[operation_id] = receipt
         session.record("fact_created", "committed_locally")
+        session.processing_mode = "semantic"
+        self._persist(session)
         return receipt
 
     def prepare_stateful(
@@ -578,8 +723,10 @@ class Gateway:
             review_plan,
         )
         session.terms = terms
+        session.processing_mode = "semantic"
         session.prepared = prepared
         session.record("prepare", "ready")
+        self._persist(session)
         return prepared
 
     def review_preview(
@@ -673,6 +820,7 @@ class Gateway:
         )
         session.commands[operation_id] = receipt
         session.record("preview_reviewed", "new_approval_required")
+        self._persist(session)
         return receipt, child
 
     def cancel_prepare(self, session: Session, request_id: str) -> None:
@@ -694,6 +842,11 @@ class Gateway:
         report: SemanticReport | None = None,
         request_id: str = "",
     ) -> Prepared:
+        self._ensure_writable(session)
+        if not session.provider_confirmed:
+            raise PrivacyError("PROVIDER_UNAVAILABLE")
+        if session.processing_mode == "semantic" and self.resolver is None:
+            raise PrivacyError("STATE_DISABLED")
         self.discard(session)
         self.validate_input(session, text, terms)
         terms = tuple(dict.fromkeys(terms))
@@ -754,6 +907,7 @@ class Gateway:
         session.terms = terms
         session.prepared = prepared
         session.record("prepare", "ready")
+        self._persist(session)
         return prepared
 
     def gate(self, prepared: Prepared, session: Session) -> list[Message]:
@@ -841,6 +995,9 @@ class Gateway:
         *,
         on_delta: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
+        self._ensure_writable(session)
+        if not session.provider_confirmed:
+            raise PrivacyError("PROVIDER_UNAVAILABLE")
         if session.busy:
             raise PrivacyError("SESSION_BUSY")
         prepared = session.prepared
@@ -855,6 +1012,20 @@ class Gateway:
         session.active_id = prepared.id
         session.cancelled = False
         provider = session.provider
+        marker = None
+        if self.store is not None:
+            marker = SendMarkerRecord(
+                marker_id=secrets.token_hex(16),
+                prepared_id=prepared.id,
+                request_sha256=hashlib.sha256(prepared.body).hexdigest(),
+                provider_id=provider.provider_id,
+                model=provider.model,
+                serializer_version=provider.serializer_version,
+                original=prepared.original,
+            )
+            session.send_marker = marker
+            session.recovery_status = "unknown_send"
+            self._persist(session)
         session.record("dispatch", provider.provider_id)
 
         async def consume() -> str:
@@ -895,6 +1066,15 @@ class Gateway:
             ]
             session.version += 1
             session.record("complete", "completed")
+            if self.store is not None:
+                session.send_marker = None
+                session.recovery_status = "none"
+                try:
+                    self._persist(session)
+                except PrivacyError:
+                    session.send_marker = marker
+                    session.recovery_status = "unknown_send"
+                    raise
             return display
         except asyncio.CancelledError:
             session.record("complete", "cancelled")
@@ -912,6 +1092,7 @@ class Gateway:
                 session.audit.clear()
 
     def cancel(self, session: Session, prepared_id: str | None = None) -> None:
+        self._ensure_writable(session, allow_unknown=True)
         if prepared_id is not None and prepared_id not in {
             session.active_id,
             session.prepared.id if session.prepared else None,
@@ -923,9 +1104,17 @@ class Gateway:
         session.prepared = None
         session.version += 1
         session.record("cancel", "requested")
+        self._persist(session)
 
     def delete(self, session: Session) -> None:
         self.cancel(session)
+        if self.store is not None:
+            try:
+                self.store.delete(session.owner, session.id)
+            except Exception:
+                session.persistence_failed = True
+                session.recovery_status = "storage_failed"
+                raise PrivacyError("STORAGE_UNAVAILABLE") from None
         session.closed = True
         session.private_history.clear()
         session.provider_history.clear()
