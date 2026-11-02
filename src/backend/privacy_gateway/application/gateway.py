@@ -220,6 +220,12 @@ class Gateway:
         session.commands = {key: item.to_domain() for key, item in record.commands.items()}
         session.terms = tuple(record.terms)
         session.literal_policies = tuple(record.literal_policies)
+        known_sources = {source.id for source in session.state.sources}
+        if record.processing_mode == "semantic_state" and any(
+            message.role == "user" and message.source_id not in known_sources
+            for message in record.provider_history
+        ):
+            raise PrivacyError("SESSION_RECORD_INVALID")
         session.send_marker = record.send_marker
         session.recovery_status = (
             "unknown_send" if record.send_marker is not None else "provider_unavailable"
@@ -243,13 +249,24 @@ class Gateway:
 
     def select_provider(self, session: Session, provider: Provider) -> None:
         self._ensure_writable(session, allow_unknown=True)
+        previous_provider = session.provider
+        previous_confirmed = session.provider_confirmed
+        previous_recovery = session.recovery_status
+        previous_version = session.version
         self.discard(session, allow_unknown=True)
         session.provider = provider
         session.provider_confirmed = True
         if session.recovery_status == "provider_unavailable":
             session.recovery_status = "none"
         session.record("provider_selected", provider.provider_id)
-        self._persist(session)
+        try:
+            self._persist(session)
+        except PrivacyError:
+            session.provider = previous_provider
+            session.provider_confirmed = previous_confirmed
+            session.recovery_status = previous_recovery
+            session.version = previous_version
+            raise
 
     def session(self, session_id: str, owner: str) -> Session:
         session = self.sessions.get(session_id)
@@ -294,9 +311,16 @@ class Gateway:
             title.encode("utf-8")
         except UnicodeError:
             raise PrivacyError("INVALID_TITLE") from None
+        previous_title = session.title
+        previous_version = session.version
         session.title = title.strip()
         session.version += 1
-        self._persist(session)
+        try:
+            self._persist(session)
+        except PrivacyError:
+            session.title = previous_title
+            session.version = previous_version
+            raise
 
     def discard(
         self, session: Session, prepared_id: str | None = None, *, allow_unknown: bool = False
@@ -413,8 +437,14 @@ class Gateway:
         self._ensure_writable(session)
         if not session.provider_confirmed:
             raise PrivacyError("PROVIDER_UNAVAILABLE")
-        if session.processing_mode == "semantic" and self.resolver is None:
-            raise PrivacyError("STATE_DISABLED")
+        if session.processing_mode == "semantic_state" and self.resolver is None:
+            raise PrivacyError("PROCESSING_MODE_UNAVAILABLE")
+        if (
+            session.processing_mode == "semantic"
+            and self.detector is None
+            and self.resolver is None
+        ):
+            raise PrivacyError("PROCESSING_MODE_UNAVAILABLE")
         if (draft_identity is not None or draft_facts is not None) and self.resolver is None:
             self.discard(session)
             raise PrivacyError("STATE_DISABLED")
@@ -505,6 +535,7 @@ class Gateway:
         text: str,
         operation_id: str | None = None,
     ) -> None:
+        self._ensure_writable(session)
         if self.resolver is None:
             raise PrivacyError("STATE_DISABLED")
         signature = hashlib.sha256(
@@ -519,6 +550,10 @@ class Gateway:
             self.discard(session)
             raise PrivacyError("STATE_COMMAND_LIMIT")
         self.discard(session)
+        previous_state = session.state
+        previous_commands = session.commands.copy()
+        previous_version = session.version
+        previous_mode = session.processing_mode
         if session.state.epoch != epoch or type(epoch) is not int:
             raise PrivacyError("STATE_STALE")
         state, source = session.state.add_source(text)
@@ -528,12 +563,20 @@ class Gateway:
         if operation_id is not None:
             session.commands[operation_id] = CommandReceipt(signature, state.epoch)
         session.record("fact_corrected", "committed_locally")
-        session.processing_mode = "semantic"
-        self._persist(session)
+        session.processing_mode = "semantic_state"
+        try:
+            self._persist(session)
+        except PrivacyError:
+            session.state = previous_state
+            session.commands = previous_commands
+            session.version = previous_version
+            session.processing_mode = previous_mode
+            raise
 
     def identity_command(
         self, session: Session, command: IdentityCommand, operation_id: str
     ) -> CommandReceipt:
+        self._ensure_writable(session)
         if self.resolver is None:
             raise PrivacyError("STATE_DISABLED")
         try:
@@ -552,6 +595,10 @@ class Gateway:
             self.discard(session)
             raise PrivacyError("STATE_COMMAND_LIMIT")
         self.discard(session)
+        previous_state = session.state
+        previous_commands = session.commands.copy()
+        previous_version = session.version
+        previous_mode = session.processing_mode
         result = apply_identity(session.state, command)
         result.state.validate()
         receipt = CommandReceipt(
@@ -560,13 +607,21 @@ class Gateway:
         session.state = result.state
         session.commands[operation_id] = receipt
         session.record("identity_" + command.kind, "committed_locally")
-        session.processing_mode = "semantic"
-        self._persist(session)
+        session.processing_mode = "semantic_state"
+        try:
+            self._persist(session)
+        except PrivacyError:
+            session.state = previous_state
+            session.commands = previous_commands
+            session.version = previous_version
+            session.processing_mode = previous_mode
+            raise
         return receipt
 
     def create_fact(
         self, session: Session, command: CreateFact, operation_id: str
     ) -> CommandReceipt:
+        self._ensure_writable(session)
         if self.resolver is None:
             raise PrivacyError("STATE_DISABLED")
         try:
@@ -585,6 +640,10 @@ class Gateway:
             self.discard(session)
             raise PrivacyError("STATE_COMMAND_LIMIT")
         self.discard(session)
+        previous_state = session.state
+        previous_commands = session.commands.copy()
+        previous_version = session.version
+        previous_mode = session.processing_mode
         result = apply_manual_fact(session.state, command)
         receipt = CommandReceipt(
             signature,
@@ -595,8 +654,15 @@ class Gateway:
         session.state = result.state
         session.commands[operation_id] = receipt
         session.record("fact_created", "committed_locally")
-        session.processing_mode = "semantic"
-        self._persist(session)
+        session.processing_mode = "semantic_state"
+        try:
+            self._persist(session)
+        except PrivacyError:
+            session.state = previous_state
+            session.commands = previous_commands
+            session.version = previous_version
+            session.processing_mode = previous_mode
+            raise
         return receipt
 
     def prepare_stateful(
@@ -723,7 +789,7 @@ class Gateway:
             review_plan,
         )
         session.terms = terms
-        session.processing_mode = "semantic"
+        session.processing_mode = "semantic_state"
         session.prepared = prepared
         session.record("prepare", "ready")
         self._persist(session)
@@ -737,6 +803,7 @@ class Gateway:
         expected_epoch: int,
         command: RejectNewMask,
     ) -> tuple[CommandReceipt, Prepared | None]:
+        self._ensure_writable(session)
         from privacy_gateway.adapters.state_resolver import Resolution
         from privacy_gateway.domain.state_proposals import StateDelta
 
@@ -824,6 +891,7 @@ class Gateway:
         return receipt, child
 
     def cancel_prepare(self, session: Session, request_id: str) -> None:
+        self._ensure_writable(session, allow_unknown=True)
         if len(session.cancelled_prepares) >= 128 and request_id not in session.cancelled_prepares:
             raise PrivacyError("SESSION_LIMIT")
         session.cancelled_prepares.add(request_id)
@@ -845,8 +913,15 @@ class Gateway:
         self._ensure_writable(session)
         if not session.provider_confirmed:
             raise PrivacyError("PROVIDER_UNAVAILABLE")
-        if session.processing_mode == "semantic" and self.resolver is None:
-            raise PrivacyError("STATE_DISABLED")
+        if session.processing_mode == "semantic_state" and self.resolver is None:
+            raise PrivacyError("PROCESSING_MODE_UNAVAILABLE")
+        if (
+            session.processing_mode == "semantic"
+            and self.detector is None
+            and self.resolver is None
+            and report is None
+        ):
+            raise PrivacyError("PROCESSING_MODE_UNAVAILABLE")
         self.discard(session)
         self.validate_input(session, text, terms)
         terms = tuple(dict.fromkeys(terms))
@@ -904,6 +979,8 @@ class Gateway:
             report,
             request_id,
         )
+        if report is not None:
+            session.processing_mode = "semantic"
         session.terms = terms
         session.prepared = prepared
         session.record("prepare", "ready")
@@ -1027,6 +1104,13 @@ class Gateway:
             session.recovery_status = "unknown_send"
             self._persist(session)
         session.record("dispatch", provider.provider_id)
+        previous_vault = session.vault.copy()
+        previous_state = session.state
+        previous_private_history = session.private_history.copy()
+        previous_provider_history = session.provider_history.copy()
+        previous_compiled_sources = session.compiled_sources
+        previous_literal_policies = session.literal_policies
+        previous_version = session.version
 
         async def consume() -> str:
             if not isinstance(provider, StreamingProvider):
@@ -1074,6 +1158,13 @@ class Gateway:
                 except PrivacyError:
                     session.send_marker = marker
                     session.recovery_status = "unknown_send"
+                    session.vault = previous_vault
+                    session.state = previous_state
+                    session.private_history = previous_private_history
+                    session.provider_history = previous_provider_history
+                    session.compiled_sources = previous_compiled_sources
+                    session.literal_policies = previous_literal_policies
+                    session.version = previous_version
                     raise
             return display
         except asyncio.CancelledError:

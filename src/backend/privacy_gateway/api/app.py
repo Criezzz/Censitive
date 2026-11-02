@@ -333,7 +333,9 @@ def create_app(
                 value = secrets.token_hex(32)
                 if conversation_store is not None:
                     conversation_store.put(
-                        "auth", "owners", {"owners": [item for item in sorted(known_owners | {value})]}
+                        "auth",
+                        "owners",
+                        {"owners": [item for item in sorted(known_owners | {value})]},
                     )
                     known_owners.add(value)
             clients[value] = secrets.token_hex(32)
@@ -440,6 +442,11 @@ def create_app(
             "title": session.title,
             "provider_confirmed": session.provider_confirmed,
             "recovery_status": session.recovery_status,
+            "interrupted_turn": (
+                {"text": session.send_marker.original, "status": "unknown"}
+                if session.send_marker is not None
+                else None
+            ),
             "provider": session.provider.provider_id,
             "model": session.provider.model,
             "messages": [

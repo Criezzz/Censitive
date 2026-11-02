@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 RECORD_VERSION = 1
 ProviderStatus = Literal["confirmed", "unavailable"]
 RecoveryStatus = Literal["none", "unknown_send", "provider_unavailable", "storage_failed"]
-ProcessingMode = Literal["rules", "semantic"]
+ProcessingMode = Literal["rules", "semantic", "semantic_state"]
 
 
 class _StrictModel(BaseModel):
@@ -189,7 +189,7 @@ class MessageRecord(_StrictModel):
 
 
 class BindingRecord(_StrictModel):
-    token: str = Field(min_length=1, max_length=128)
+    token: str = Field(pattern=r"\[\[PG_v1_[0-9a-f]{32}\]\]")
     value: str = Field(max_length=20_000)
     restore_allowed: bool = True
     scope: str = Field(default="", max_length=128)
@@ -290,6 +290,13 @@ class SessionRecord(_StrictModel):
     def command_keys_are_ids(cls, value: dict[str, CommandRecord]) -> dict[str, CommandRecord]:
         if len(value) > 128 or any(not key or len(key) > 256 for key in value):
             raise ValueError("invalid command map")
+        return value
+
+    @field_validator("vault")
+    @classmethod
+    def unique_vault_tokens(cls, value: list[BindingRecord]) -> list[BindingRecord]:
+        if len(value) > 1024 or len({item.token for item in value}) != len(value):
+            raise ValueError("invalid vault")
         return value
 
     def json_bytes(self) -> bytes:

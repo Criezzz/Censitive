@@ -34,14 +34,6 @@ class CorruptStoreError(ConversationStoreError):
     pass
 
 
-class RecordNotFoundError(ConversationStoreError):
-    pass
-
-
-class VersionConflictError(ConversationStoreError):
-    pass
-
-
 class StoreBusyError(ConversationStoreError):
     pass
 
@@ -98,6 +90,7 @@ class WindowsDPAPIKeyProvider:
 def _dpapi_call(value: bytes, *, protect: bool) -> bytes:
     if sys.platform != "win32":
         raise KeyUnavailableError("KEY_PROTECTION_UNAVAILABLE")
+
     class DataBlob(ctypes.Structure):
         _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
 
@@ -192,9 +185,13 @@ class EncryptedConversationStore:
         self._acquire_process_lock()
         try:
             existed = self.path.exists()
-            raw_key = bytes(key) if key is not None else (
-                key_provider or WindowsDPAPIKeyProvider()
-            ).load_or_create(self.key_path, create=not existed)
+            raw_key = (
+                bytes(key)
+                if key is not None
+                else (key_provider or WindowsDPAPIKeyProvider()).load_or_create(
+                    self.key_path, create=not existed
+                )
+            )
             self._validate_key(raw_key)
             self._aead_key, self._index_key = self._derive_keys(raw_key)
             del raw_key
@@ -335,6 +332,7 @@ class EncryptedConversationStore:
         if len(encoded) > cls._MAX_RECORD_BYTES:
             raise CorruptStoreError("RECORD_TOO_LARGE")
         try:
+
             def reject_constant(_: str) -> None:
                 raise ValueError("non-finite")
 
@@ -386,9 +384,7 @@ class EncryptedConversationStore:
         )
         return hmac.new(self._index_key, material, hashlib.sha256).digest()
 
-    def _record_aad(
-        self, namespace: str, record_id: str, version: int, record_key: bytes
-    ) -> bytes:
+    def _record_aad(self, namespace: str, record_id: str, version: int, record_key: bytes) -> bytes:
         try:
             namespace_bytes = self._locator_bytes(namespace)
             record_bytes = self._locator_bytes(record_id)
@@ -514,11 +510,7 @@ class EncryptedConversationStore:
         return StoredRecord(namespace, record_id, version, dict(record))
 
     def _outer_aad(self, record_key: bytes, version: int) -> bytes:
-        return (
-            self._RECORD_AAD_PREFIX
-            + record_key
-            + struct.pack("!I", version)
-        )
+        return self._RECORD_AAD_PREFIX + record_key + struct.pack("!I", version)
 
     def _fetch(self, namespace: str, record_id: str) -> StoredRecord | None:
         record_key = self._record_key(namespace, record_id)
@@ -600,22 +592,6 @@ class EncryptedConversationStore:
                 raise CorruptStoreError("STORE_UNAVAILABLE") from None
             return StoredRecord(namespace, record_id, version, normalized)
 
-    def update(
-        self,
-        namespace: str,
-        record_id: str,
-        data: Mapping[str, JSONValue],
-        *,
-        expected_version: int | None = None,
-    ) -> StoredRecord:
-        with self._guard():
-            current = self._fetch(namespace, record_id)
-            if current is None:
-                raise RecordNotFoundError("RECORD_NOT_FOUND")
-            if expected_version is not None and current.version != expected_version:
-                raise VersionConflictError("VERSION_CONFLICT")
-            return self.put(namespace, record_id, data)
-
     def delete(self, namespace: str, record_id: str) -> bool:
         with self._guard():
             record_key = self._record_key(namespace, record_id)
@@ -626,29 +602,6 @@ class EncryptedConversationStore:
             except sqlite3.Error:
                 raise CorruptStoreError("STORE_UNAVAILABLE") from None
             return cursor.rowcount == 1
-
-    def append_message(
-        self,
-        namespace: str,
-        record_id: str,
-        message: Mapping[str, JSONValue],
-        *,
-        expected_version: int | None = None,
-    ) -> StoredRecord:
-        if not isinstance(message, Mapping):
-            raise ConversationStoreError("MESSAGE_INVALID")
-        with self._guard():
-            current = self._fetch(namespace, record_id)
-            if current is None:
-                raise RecordNotFoundError("RECORD_NOT_FOUND")
-            if expected_version is not None and current.version != expected_version:
-                raise VersionConflictError("VERSION_CONFLICT")
-            messages = current.data.get("messages")
-            if not isinstance(messages, list):
-                raise ConversationStoreError("MESSAGES_INVALID")
-            updated = dict(current.data)
-            updated["messages"] = [*messages, dict(message)]
-            return self.put(namespace, record_id, updated)
 
     def close(self) -> None:
         with self._lock:
