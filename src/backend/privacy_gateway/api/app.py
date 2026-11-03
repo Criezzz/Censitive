@@ -24,6 +24,7 @@ from privacy_gateway.adapters.conversation_store import (
 )
 from privacy_gateway.adapters.provider import StreamingProvider
 from privacy_gateway.application.gateway import Gateway, Prepared, Session
+from privacy_gateway.application.session_records import EncryptedSessionRepository
 from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand
 from privacy_gateway.domain.manual_facts import CreateFact, DraftFacts
 from privacy_gateway.domain.models import SpanValidationError
@@ -165,6 +166,8 @@ def create_app(
     conversation_store: EncryptedConversationStore | None = None,
 ) -> FastAPI:
     service = gateway or Gateway()
+    if conversation_store is not None and service.store is None:
+        service.store = EncryptedSessionRepository(conversation_store)
     connections = connections or ProviderConnections(service.provider)
 
     @asynccontextmanager

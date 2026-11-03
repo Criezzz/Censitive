@@ -166,6 +166,8 @@ class Gateway:
         self.store = store
 
     def _ensure_writable(self, session: Session, *, allow_unknown: bool = False) -> None:
+        if session.closed:
+            raise PrivacyError("SESSION_NOT_FOUND")
         if session.persistence_failed:
             raise PrivacyError("STORAGE_UNAVAILABLE")
         if session.recovery_status == "unknown_send" and not allow_unknown:
@@ -1102,7 +1104,12 @@ class Gateway:
             )
             session.send_marker = marker
             session.recovery_status = "unknown_send"
-            self._persist(session)
+            try:
+                self._persist(session)
+            except PrivacyError:
+                session.active_id = None
+                session.active_task = None
+                raise
         session.record("dispatch", provider.provider_id)
         previous_vault = session.vault.copy()
         previous_state = session.state
