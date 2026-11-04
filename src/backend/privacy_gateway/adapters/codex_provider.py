@@ -5,14 +5,17 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Mapping
+import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES, MAX_REQUEST_BYTES
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.serialization import strict_json
 
-CLI_SHA256 = "c057fc84bb0d76fc6710e3c82b88ae47464239bd41db89b9b84cc6bbac3265bb"
+CLI_SHA256 = "f5521b058ca08e249afd3b25b4681e81100181d92e73aa6b94bb8e75c2aa487b"
 INSTRUCTIONS = (
     "You answer a text conversation supplied as a JSON object with model and messages. "
     "Answer the last user message using that conversation's context. Reply in the user's "
@@ -51,6 +54,28 @@ def toml(value: Any) -> str:
     if isinstance(value, dict):
         return "{" + ",".join(f"{k}={toml(v)}" for k, v in value.items()) + "}"
     return json.dumps(value)
+
+
+@contextmanager
+def request_directory() -> Iterator[str]:
+    parent = Path(tempfile.gettempdir()).resolve()
+    temporary = tempfile.TemporaryDirectory(prefix="censitive-codex-", dir=parent)
+    owned = Path(temporary.name).resolve()
+    if owned.parent != parent or not owned.name.startswith("censitive-codex-"):
+        raise PrivacyError("CODEX_TEMP_INVALID")
+    try:
+        yield temporary.name
+    finally:
+        for attempt in range(40):
+            if Path(temporary.name).resolve() != owned:
+                raise PrivacyError("CODEX_TEMP_INVALID")
+            try:
+                temporary.cleanup()
+                break
+            except PermissionError:
+                if attempt == 39:
+                    raise PrivacyError("CODEX_CLEANUP_FAILED") from None
+                time.sleep(0.05)
 
 
 class CodexProvider:
@@ -220,6 +245,8 @@ class CodexProvider:
         return command + ["-"]
 
     def _validate_body(self, body: bytes) -> None:
+        if len(body) > MAX_REQUEST_BYTES:
+            raise PrivacyError("INVALID_PAYLOAD")
         try:
             payload = strict_json(body)
         except PrivacyError:
@@ -230,7 +257,7 @@ class CodexProvider:
             or set(payload) != {"model", "messages", *options}
             or payload.get("model") != self.model
             or not isinstance(payload.get("messages"), list)
-            or not 1 <= len(payload["messages"]) <= 40
+            or not 1 <= len(payload["messages"]) <= MAX_HISTORY_MESSAGES
             or any(
                 type(message) is not dict
                 or set(message) != {"role", "content"}
@@ -251,7 +278,7 @@ class CodexProvider:
             self._validate_body(body)
             await asyncio.to_thread(self._verify_binary)
             await asyncio.to_thread(self.check_login)
-            with tempfile.TemporaryDirectory(prefix="censitive-codex-") as folder:
+            with request_directory() as folder:
                 process = await asyncio.create_subprocess_exec(
                     *self.command(Path(folder)),
                     cwd=folder,

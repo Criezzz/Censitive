@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type {
+  JevAssessment,
   ChatMessage,
   Preview,
   PreviewDecision,
@@ -8,6 +9,9 @@ import type {
   Phase,
   Bootstrap,
   SessionIdentity,
+  SessionList,
+  SessionSummary,
+  SessionMutation,
   FactState,
   Correction,
   DraftAction,
@@ -16,6 +20,13 @@ import type {
   ProtectionCommand,
   FactResult,
   IdentityResult,
+  PrivateWorkPhase,
+  PrivateWorkPreview,
+  PrivateWorkRecord,
+  InterruptedPrivateWork,
+  LedgerRevision,
+  PrivateLedgerCandidate,
+  PrivateLedgerProposalResult,
 } from "../data/contracts";
 import {
   errors,
@@ -27,6 +38,48 @@ import type { Sample } from "../data/samples";
 import { selectedOccurrence } from "../data/occurrences";
 import { api, setCsrf, sendStream } from "../network/api";
 import { readStream } from "../stream";
+import {
+  emptyLedgerDraft,
+  structuredLedgerValues,
+  type StructuredLedgerDraft,
+  type StructuredLedgerValues,
+} from "../data/structuredLedger";
+
+const ACTIVE_SESSION_HINT_KEY = "censitive.active_session";
+
+function validPrivatePreview(value: PrivateWorkPreview): boolean {
+  return (
+    typeof value.prepared_id === "string" &&
+    typeof value.public_body === "string" &&
+    typeof value.public_body_sha256 === "string" &&
+    typeof value.provider === "string" &&
+    typeof value.model === "string"
+  );
+}
+
+function readActiveSessionHint(): string {
+  try {
+    const value = window.localStorage.getItem(ACTIVE_SESSION_HINT_KEY) ?? "";
+    return /^[a-f0-9]{32}$/.test(value) ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+function writeActiveSessionHint(id: string) {
+  if (!/^[a-f0-9]{32}$/.test(id)) return;
+  try {
+    window.localStorage.setItem(ACTIVE_SESSION_HINT_KEY, id);
+  } catch {
+  }
+}
+
+function clearActiveSessionHint() {
+  try {
+    window.localStorage.removeItem(ACTIVE_SESSION_HINT_KEY);
+  } catch {
+  }
+}
 
 export function useChatController() {
   const [provider, setProvider] = useState("local-demo");
@@ -40,6 +93,16 @@ export function useChatController() {
   const codex = provider === "codex-chatgpt";
   const localModel = provider === "local-qwen";
   const [session, setSession] = useState("");
+  const [sessionTitle, setSessionTitle] = useState("");
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [persistenceEnabled, setPersistenceEnabled] = useState(false);
+  const [sessionMutation, setSessionMutation] =
+    useState<SessionMutation | null>(null);
+  const [recoveryStatus, setRecoveryStatus] = useState<string | null>(null);
+  const [interruptedTurn, setInterruptedTurn] = useState<{
+    text: string;
+    status: string;
+  } | null>(null);
   const [factState, setFactState] = useState<FactState | null>(null);
   const [factsConfirmed, setFactsConfirmed] = useState(true);
   const [identityConfirmed, setIdentityConfirmed] = useState(true);
@@ -69,15 +132,68 @@ export function useChatController() {
   const [audit, setAudit] = useState<SessionView["audit"]>([]);
   const [showAudit, setShowAudit] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
+  const [privateWorkAvailable, setPrivateWorkAvailable] = useState(false);
+  const [jevEnabled, setJevEnabled] = useState(false);
+  const [jevConfigured, setJevConfigured] = useState(false);
+  const [jevKeyOpen, setJevKeyOpen] = useState(false);
+  const [jevKey, setJevKey] = useState("");
+  const [jevKeyBusy, setJevKeyBusy] = useState(false);
+  const [latestJev, setLatestJev] = useState<JevAssessment | null>(null);
+  const [privateWorkHistory, setPrivateWorkHistory] = useState<
+    PrivateWorkRecord[]
+  >([]);
+  const [privatePublicTask, setPrivatePublicTask] = useState("");
+  const [privateContext, setPrivateContext] = useState("");
+  const [privatePhase, setPrivatePhase] = useState<PrivateWorkPhase>("idle");
+  const [privatePreview, setPrivatePreview] =
+    useState<PrivateWorkPreview | null>(null);
+  const [privateError, setPrivateError] = useState("");
+  const [privateCancelPending, setPrivateCancelPending] = useState(false);
+  const [interruptedPrivateWork, setInterruptedPrivateWork] =
+    useState<InterruptedPrivateWork | null>(null);
+  const [privateLedgerAvailable, setPrivateLedgerAvailable] = useState(false);
+  const [privateLedgerModelAvailable, setPrivateLedgerModelAvailable] =
+    useState(false);
+  const [structuredLedgerDraft, setStructuredLedgerDraft] =
+    useState<StructuredLedgerDraft>(emptyLedgerDraft);
+  const [privateLedgerHistory, setPrivateLedgerHistory] = useState<
+    LedgerRevision[]
+  >([]);
+  const [privateLedgerSource, setPrivateLedgerSource] = useState("");
+  const [privateLedgerPhase, setPrivateLedgerPhase] = useState<
+    "idle" | "proposing" | "candidate" | "confirming"
+  >("idle");
+  const [privateLedgerCandidate, setPrivateLedgerCandidate] =
+    useState<PrivateLedgerCandidate | null>(null);
+  const [privateLedgerUse, setPrivateLedgerUseState] = useState(false);
+  const [privateLedgerError, setPrivateLedgerError] = useState("");
+  const [privateLedgerNotice, setPrivateLedgerNotice] = useState("");
+  const [privateLedgerCancelPending, setPrivateLedgerCancelPending] =
+    useState(false);
+  const [privateLedgerRerunPending, setPrivateLedgerRerunPending] =
+    useState(false);
+  const privateLedgerRequestId = useRef("");
   const generation = useRef(0);
+  const discardTasks = useRef(new Map<string, Promise<void>>());
   const bottom = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const providerButton = useRef<HTMLButtonElement>(null);
-  const busy =
+  const chatBusy =
+    jevKeyBusy ||
+    cancelPending ||
     phase === "preparing" ||
     phase === "sending" ||
     phase === "loading" ||
-    pendingReview !== null;
+    pendingReview !== null ||
+    privatePhase === "preparing" ||
+    privatePhase === "sending" ||
+    privateCancelPending ||
+    privateLedgerPhase === "proposing" ||
+    privateLedgerPhase === "confirming" ||
+    privateLedgerCandidate !== null ||
+    privateLedgerCancelPending ||
+    privateLedgerRerunPending;
+  const busy = chatBusy || sessionMutation !== null;
 
   function explain(reason: unknown) {
     const code = reason instanceof Error ? reason.message : "REQUEST_FAILED";
@@ -86,14 +202,160 @@ export function useChatController() {
         "Không thể kết nối ứng dụng local. Kiểm tra backend rồi thử lại.",
     );
   }
-  async function refresh(id: string) {
-    const state = await api<SessionView>(`/sessions/${id}`);
+  function applySession(state: SessionView, restoreDraftState = false) {
+    writeActiveSessionHint(state.id);
+    setSessionTitle(state.title ?? "");
     setProvider(state.provider);
     setModel(state.model);
-    setProviderConfirmed(true);
+    setProviderConfirmed(
+      typeof state.provider_confirmed === "boolean"
+        ? state.provider_confirmed
+        : true,
+    );
+    setRecoveryStatus(state.recovery_status ?? null);
+    setInterruptedTurn(state.interrupted_turn ?? null);
+    setInterruptedPrivateWork(state.interrupted_private_work ?? null);
+    if (restoreDraftState && Array.isArray(state.terms))
+      setTerms(state.terms.join("\n"));
     setMessages(state.messages);
     setAudit(state.audit);
     setFactState(state.state ?? null);
+    setPrivateWorkAvailable(state.private_work_available === true);
+    setLatestJev(state.latest_jev ?? null);
+    setPrivateWorkHistory(
+      Array.isArray(state.private_work_history)
+        ? state.private_work_history
+        : [],
+    );
+    setPrivateLedgerAvailable(state.private_ledger_available === true);
+    setPrivateLedgerModelAvailable(
+      (state.private_ledger_model_available ??
+        state.private_ledger_available) === true,
+    );
+    setStructuredLedgerDraft(emptyLedgerDraft);
+    setPrivateLedgerHistory(
+      Array.isArray(state.private_ledger_history)
+        ? state.private_ledger_history
+        : [],
+    );
+    setPrivateLedgerSource("");
+    setPrivateLedgerCandidate(null);
+    setPrivateLedgerPhase("idle");
+    setPrivateLedgerUseState(false);
+    setPrivateLedgerError("");
+    setPrivateLedgerNotice("");
+    setPrivateLedgerCancelPending(false);
+    setPrivateLedgerRerunPending(false);
+    privateLedgerRequestId.current = "";
+    setPrivatePhase("idle");
+    setPrivatePreview(null);
+    setPrivateError("");
+    setPrivateCancelPending(false);
+  }
+  async function refresh(
+    id: string,
+    restoreDraftState = false,
+    expectedGeneration?: number,
+  ) {
+    const state = await api<SessionView>(`/sessions/${id}`);
+    if (
+      expectedGeneration !== undefined &&
+      (expectedGeneration !== generation.current || id !== session)
+    )
+      return null;
+    applySession(state, restoreDraftState);
+    setSessions((current) =>
+      current.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              ...(state.title !== undefined ? { title: state.title } : {}),
+              provider: state.provider,
+              model: state.model,
+              provider_confirmed: state.provider_confirmed,
+              recovery_status: state.recovery_status,
+              message_count: state.messages.length,
+              private_work_count: state.private_work_history?.length ?? 0,
+            }
+          : item,
+      ),
+    );
+    return state;
+  }
+  async function refreshSessions() {
+    const result = await api<SessionList>("/sessions");
+    const next = Array.isArray(result.sessions) ? result.sessions : [];
+    setSessions(next);
+    return next;
+  }
+  function queueDiscard(id: string, preparedId: string) {
+    const task = api(`/sessions/${id}/discard`, "POST", {
+      prepared_id: preparedId,
+    }).then(() => undefined);
+    discardTasks.current.set(id, task);
+    const clear = () => {
+      if (discardTasks.current.get(id) === task)
+        discardTasks.current.delete(id);
+    };
+    task.then(clear, clear);
+    return task;
+  }
+  async function waitForSessionDiscard(id: string) {
+    const inFlight = discardTasks.current.get(id);
+    if (inFlight) {
+      await inFlight;
+      return;
+    }
+    if (id !== session) return;
+    const preparedIds = [
+      preview?.id,
+      pendingReview?.prepared_id,
+      privatePreview?.prepared_id,
+    ].filter((value): value is string => Boolean(value));
+    const uniqueIds = [...new Set(preparedIds)];
+    if (uniqueIds.length === 0) return;
+    setPreview(null);
+    setPendingReview(null);
+    setPrivatePreview(null);
+    await Promise.all(
+      uniqueIds.map((preparedId) => queueDiscard(id, preparedId)),
+    );
+  }
+  function latestSession(items: SessionSummary[]) {
+    return items[0] ?? null;
+  }
+  function clearConversationDraft() {
+    setJevEnabled(false);
+    setJevKey("");
+    setJevKeyOpen(false);
+    setLatestJev(null);
+    setDraft("");
+    setTerms("");
+    setPreview(null);
+    setPendingReview(null);
+    setProvisional(null);
+    clearDraftIdentity();
+    identityOperation.current = null;
+    setFactsConfirmed(true);
+    setIdentityConfirmed(true);
+    setPrivatePublicTask("");
+    setPrivateContext("");
+    setPrivatePhase("idle");
+    setPrivatePreview(null);
+    setPrivateError("");
+    setPrivateCancelPending(false);
+    setPrivateLedgerSource("");
+    setPrivateLedgerCandidate(null);
+    setPrivateLedgerPhase("idle");
+    setPrivateLedgerUseState(false);
+    setPrivateLedgerError("");
+    setPrivateLedgerNotice("");
+    setPrivateLedgerCancelPending(false);
+    setPrivateLedgerRerunPending(false);
+    setPrivateLedgerHistory([]);
+    setPrivateLedgerAvailable(false);
+    privateLedgerRequestId.current = "";
+    setInterruptedPrivateWork(null);
   }
   async function initialize() {
     try {
@@ -102,19 +364,22 @@ export function useChatController() {
       setDetector(boot.detector);
       setProvider(boot.provider);
       setModel(boot.model);
-      const created = await api<SessionIdentity>("/sessions", "POST");
-      setProvider(created.provider);
-      setModel(created.model);
-      setSession(created.id);
-      setFactState({
-        enabled: !!boot.state_enabled,
-        epoch: 0,
-        facts: [],
-        sources: [],
-        entities: [],
-      });
+      setPersistenceEnabled(boot.persistence_enabled === true);
+      const listed = await refreshSessions();
+      const hinted = readActiveSessionHint();
+      const existing =
+        listed.find((item) => item.id === hinted) ?? latestSession(listed);
+      if (existing) {
+        setSession(existing.id);
+        await refresh(existing.id, true);
+      } else {
+        if (hinted) clearActiveSessionHint();
+        const created = await api<SessionIdentity>("/sessions", "POST");
+        setSession(created.id);
+        await refresh(created.id, true);
+        await refreshSessions();
+      }
       setFactsConfirmed(true);
-      setProviderConfirmed(true);
       setPhase("idle");
     } catch (reason) {
       explain(reason);
@@ -125,9 +390,6 @@ export function useChatController() {
     void initialize();
     return () => activeStream.current?.abort();
   }, []);
-  useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages, phase, provisional]);
   useEffect(() => {
     setDraftActions([]);
     setDraftFacts([]);
@@ -145,9 +407,7 @@ export function useChatController() {
     if (clearIdentity) clearDraftIdentity();
     generation.current++;
     if (preview && session)
-      void api(`/sessions/${session}/discard`, "POST", {
-        prepared_id: preview.id,
-      }).catch(explain);
+      void queueDiscard(session, preview.id).catch(explain);
     setPreview(null);
     setError("");
     if (phase !== "sending" && phase !== "loading") setPhase("idle");
@@ -155,6 +415,12 @@ export function useChatController() {
   async function selectProvider(nextProvider: string, nextModel: string) {
     if (busy || !identityConfirmed) throw new Error("SESSION_BUSY");
     clearDraftIdentity();
+    if (preview && session)
+      void queueDiscard(session, preview.id).catch(explain);
+    setPendingReview(null);
+    invalidatePrivatePreview();
+    setPrivatePublicTask("");
+    setPrivateContext("");
     setPhase("loading");
     generation.current++;
     setPreview(null);
@@ -190,12 +456,16 @@ export function useChatController() {
     if (
       !draft.trim() ||
       !session ||
+      phase !== "idle" ||
       busy ||
       !providerConfirmed ||
       !factsConfirmed ||
-      !identityConfirmed
+      !identityConfirmed ||
+      recoveryStatus === "unknown_send" ||
+      recoveryStatus === "storage_failed"
     )
       return;
+    if (privatePhase === "ready") invalidatePrivatePreview();
     const attempt = ++generation.current;
     preparingId.current = crypto.randomUUID().replaceAll("-", "");
     setError("");
@@ -255,18 +525,607 @@ export function useChatController() {
       }
     }
   }
+  function explainPrivate(reason: unknown) {
+    const code = reason instanceof Error ? reason.message : "REQUEST_FAILED";
+    setPrivateError(
+      errors[code] ??
+        "Chưa xác nhận được kết quả private work. Hãy kiểm tra lịch sử hoặc tạo phiên mới; không tự gửi lại.",
+    );
+  }
+  function discardPrivatePreview(sessionId: string, preparedId: string) {
+    return queueDiscard(sessionId, preparedId);
+  }
+  function invalidatePrivatePreview() {
+    const oldPreview = privatePreview;
+    generation.current++;
+    if (oldPreview && session)
+      void discardPrivatePreview(session, oldPreview.prepared_id).catch(
+        explainPrivate,
+      );
+    setPrivatePreview(null);
+    setPrivatePhase("idle");
+    setPrivateError("");
+    setPrivateCancelPending(false);
+  }
+  function latestPrivateLedgerRevision(): LedgerRevision | null {
+    return privateLedgerHistory[privateLedgerHistory.length - 1] ?? null;
+  }
+  function explainPrivateLedger(reason: unknown) {
+    const code = reason instanceof Error ? reason.message : "REQUEST_FAILED";
+    setPrivateLedgerError(
+      errors[code] ??
+        "Chưa xác nhận được sổ dữ liệu local. Hãy kiểm tra trạng thái phiên rồi thử lại.",
+    );
+  }
+  function isLedgerRevision(value: unknown): value is LedgerRevision {
+    if (!value || typeof value !== "object") return false;
+    const revision = value as Partial<LedgerRevision>;
+    return (
+      typeof revision.revision === "number" &&
+      Number.isInteger(revision.revision) &&
+      revision.revision > 0 &&
+      typeof revision.source_sha256 === "string" &&
+      Array.isArray(revision.events) &&
+      Array.isArray(revision.records)
+    );
+  }
+  async function cancelPrivateLedgerProposal(
+    sessionId: string,
+    requestId: string,
+  ) {
+    if (!requestId) return;
+    await api(`/sessions/${sessionId}/cancel`, "POST", {
+      prepared_id: requestId,
+    });
+  }
+  async function proposePrivateLedger(values?: StructuredLedgerValues) {
+    if (
+      !privateLedgerAvailable ||
+      (!values &&
+        (!privateLedgerModelAvailable || !privateLedgerSource.trim())) ||
+      !session ||
+      busy ||
+      phase !== "idle" ||
+      privatePhase !== "idle" ||
+      pendingReview !== null ||
+      sessionMutation !== null ||
+      recoveryStatus === "unknown_send" ||
+      recoveryStatus === "storage_failed" ||
+      privateLedgerPhase !== "idle" ||
+      privateLedgerCandidate !== null
+    )
+      return;
+    if (preview) invalidate(false);
+    const attempt = ++generation.current;
+    const sessionId = session;
+    const source = privateLedgerSource;
+    const baseRevision = latestPrivateLedgerRevision()?.revision ?? 0;
+    const requestId = crypto.randomUUID().replaceAll("-", "");
+    privateLedgerRequestId.current = requestId;
+    setPrivateLedgerError("");
+    setPrivateLedgerNotice("");
+    setPrivateLedgerPhase("proposing");
+    try {
+      const result = await api<PrivateLedgerProposalResult>(
+        `/sessions/${sessionId}/private-ledger/propose${values ? "-structured" : ""}`,
+        "POST",
+        {
+          ...(values ? { values } : { private_source: source }),
+          base_revision: baseRevision,
+          request_id: requestId,
+        },
+      );
+      if (attempt !== generation.current || sessionId !== session) {
+        if (privateLedgerRequestId.current === requestId)
+          await cancelPrivateLedgerProposal(sessionId, requestId).catch(
+            () => {},
+          );
+        return;
+      }
+      if (result && "status" in result) {
+        if (
+          result.status !== "no_changes" ||
+          result.base_revision !== baseRevision ||
+          Object.keys(result).length !== 2
+        )
+          throw new Error("PRIVATE_LEDGER_OUTCOME_UNKNOWN");
+        setPrivateLedgerNotice(
+          values
+            ? "Giá trị nhập tay không thay đổi dữ liệu đã xác nhận."
+            : "Model không đề xuất thay đổi. Dữ liệu đã xác nhận chưa được sửa; hãy kiểm tra lại nếu bạn mong đợi thay đổi.",
+        );
+        setPrivateLedgerPhase("idle");
+        privateLedgerRequestId.current = "";
+        return;
+      }
+      if (
+        !result ||
+        typeof result.proposal_id !== "string" ||
+        result.proposal_id.length === 0 ||
+        !isLedgerRevision(result.candidate)
+      )
+        throw new Error("PRIVATE_LEDGER_OUTCOME_UNKNOWN");
+      setPrivateLedgerCandidate(result);
+      setPrivateLedgerPhase("candidate");
+    } catch (reason) {
+      if (attempt === generation.current && sessionId === session) {
+        explainPrivateLedger(reason);
+        setPrivateLedgerPhase("idle");
+        privateLedgerRequestId.current = "";
+      }
+    }
+  }
+  async function proposeStructuredLedger() {
+    if (busy) return;
+    try {
+      await proposePrivateLedger(structuredLedgerValues(structuredLedgerDraft));
+    } catch (reason) {
+      explainPrivateLedger(reason);
+    }
+  }
+  function changeStructuredLedger(
+    field: keyof StructuredLedgerDraft,
+    value: string,
+  ) {
+    if (busy || privateLedgerPhase !== "idle") return;
+    if (preview) invalidate(false);
+    if (privatePreview) invalidatePrivatePreview();
+    setStructuredLedgerDraft((previous) => ({ ...previous, [field]: value }));
+    setPrivateLedgerUseState(false);
+    setPrivateLedgerError("");
+    setPrivateLedgerNotice("");
+  }
+  async function confirmPrivateLedger() {
+    const pending = privateLedgerCandidate;
+    if (
+      !pending ||
+      !session ||
+      privateLedgerPhase !== "candidate" ||
+      phase !== "idle" ||
+      privatePhase !== "idle" ||
+      pendingReview !== null ||
+      sessionMutation !== null ||
+      recoveryStatus === "unknown_send" ||
+      recoveryStatus === "storage_failed"
+    )
+      return;
+    const attempt = ++generation.current;
+    const sessionId = session;
+    setPrivateLedgerPhase("confirming");
+    setPrivateLedgerError("");
+    setPrivateLedgerNotice("");
+    let acknowledged = false;
+    let refreshed: SessionView | null = null;
+    try {
+      const result = await api<{ ok: boolean }>(
+        `/sessions/${sessionId}/private-ledger/confirm`,
+        "POST",
+        { proposal_id: pending.proposal_id },
+      );
+      if (result.ok !== true) throw new Error("PRIVATE_LEDGER_OUTCOME_UNKNOWN");
+      acknowledged = true;
+    } catch (reason) {
+      explainPrivateLedger(reason);
+    }
+    try {
+      refreshed = await refresh(sessionId, false, attempt);
+    } catch {
+      refreshed = null;
+    }
+    if (attempt !== generation.current || sessionId !== session) return;
+    const observed = refreshed?.private_ledger_history?.some(
+      (item) => item.revision === pending.candidate.revision,
+    );
+    setPrivateLedgerCandidate(null);
+    setPrivateLedgerSource("");
+    setPrivateLedgerPhase("idle");
+    privateLedgerRequestId.current = "";
+    if (acknowledged && observed) {
+      setPrivateLedgerUseState(true);
+      setPrivateLedgerError(
+        "Đã lưu bản ghi local. Bạn có thể dùng bản ghi này cho việc riêng.",
+      );
+    } else {
+      setPrivateLedgerUseState(false);
+      setPrivateLedgerError(
+        "Chưa thể xác nhận chắc chắn thay đổi local. Đã tải lại trạng thái phiên; hãy kiểm tra sổ trước khi dùng.",
+      );
+    }
+  }
+  async function discardPrivateLedger() {
+    const requestId =
+      privateLedgerCandidate?.proposal_id ?? privateLedgerRequestId.current;
+    const sourceDraft = privateLedgerSource;
+    const formDraft = structuredLedgerDraft;
+    if (
+      !requestId &&
+      !privateLedgerCandidate &&
+      privateLedgerPhase !== "proposing"
+    )
+      return;
+    const sessionId = session;
+    const attempt = ++generation.current;
+    setPrivateLedgerCancelPending(true);
+    setPrivateLedgerCandidate(null);
+    setPrivateLedgerPhase("confirming");
+    setPrivateLedgerUseState(false);
+    privateLedgerRequestId.current = "";
+    if (!sessionId || !requestId) {
+      setPrivateLedgerPhase("idle");
+      setPrivateLedgerCancelPending(false);
+      return;
+    }
+    try {
+      await cancelPrivateLedgerProposal(sessionId, requestId);
+      if (attempt !== generation.current || sessionId !== session) return;
+      await refresh(sessionId, false, attempt);
+      if (attempt !== generation.current || sessionId !== session) return;
+      setPrivateLedgerSource(sourceDraft);
+      setStructuredLedgerDraft(formDraft);
+      setPrivateLedgerError(
+        "Đã nhận xác nhận hủy đề xuất local; không có bản ghi nào được thay đổi.",
+      );
+    } catch (reason) {
+      if (attempt !== generation.current || sessionId !== session) return;
+      await refresh(sessionId, false, attempt).catch(() => null);
+      if (attempt === generation.current && sessionId === session) {
+        setPrivateLedgerSource(sourceDraft);
+        setStructuredLedgerDraft(formDraft);
+        explainPrivateLedger(reason);
+      }
+    } finally {
+      if (attempt === generation.current && sessionId === session) {
+        setPrivateLedgerPhase("idle");
+        setPrivateLedgerCancelPending(false);
+      }
+    }
+  }
+  function changePrivateLedgerSource(text: string) {
+    if (
+      privateLedgerPhase === "proposing" ||
+      privateLedgerPhase === "confirming" ||
+      privateLedgerCandidate !== null
+    )
+      return;
+    if (privatePreview) invalidatePrivatePreview();
+    setPrivateLedgerError("");
+    setPrivateLedgerNotice("");
+    setPrivateLedgerSource(text);
+    setPrivateLedgerUseState(false);
+  }
+  function setPrivateLedgerUse(enabled: boolean) {
+    if (
+      !enabled ||
+      privateLedgerHistory.length === 0 ||
+      privateLedgerPhase !== "idle" ||
+      busy ||
+      phase !== "idle" ||
+      privatePhase !== "idle" ||
+      pendingReview !== null ||
+      sessionMutation !== null ||
+      recoveryStatus === "unknown_send" ||
+      recoveryStatus === "storage_failed"
+    ) {
+      if (!enabled) {
+        if (privatePreview) invalidatePrivatePreview();
+        setPrivateLedgerUseState(false);
+      }
+      return;
+    }
+    invalidatePrivatePreview();
+    setPrivateLedgerUseState(true);
+    setPrivateLedgerError("");
+    setPrivateLedgerNotice("");
+  }
+  async function toggleJev() {
+    if (busy) return;
+    if (privatePreview) invalidatePrivatePreview();
+    if (jevEnabled) {
+      setJevEnabled(false);
+      return;
+    }
+    if (jevConfigured) {
+      setJevEnabled(true);
+      return;
+    }
+    setJevKeyBusy(true);
+    setPrivateError("");
+    try {
+      const status = await api<{ configured: boolean }>("/jev");
+      setJevConfigured(status.configured === true);
+      setJevEnabled(status.configured === true);
+      setJevKeyOpen(status.configured !== true);
+    } catch (reason) {
+      explainPrivate(reason);
+    } finally {
+      setJevKeyBusy(false);
+    }
+  }
+  async function saveJevKey() {
+    if (busy || !jevKey.trim()) return;
+    const key = jevKey.trim();
+    setJevKey("");
+    setJevKeyBusy(true);
+    setPrivateError("");
+    try {
+      await api("/jev", "POST", { key });
+      setJevConfigured(true);
+      setJevEnabled(true);
+      setJevKeyOpen(false);
+      if (privatePreview) invalidatePrivatePreview();
+    } catch (reason) {
+      explainPrivate(reason);
+    } finally {
+      setJevKeyBusy(false);
+    }
+  }
+  async function removeJevKey() {
+    if (busy) return;
+    setJevKeyBusy(true);
+    setPrivateError("");
+    try {
+      await api("/jev", "DELETE");
+      setJevConfigured(false);
+      setJevEnabled(false);
+      setJevKey("");
+      if (privatePreview) invalidatePrivatePreview();
+    } catch (reason) {
+      explainPrivate(reason);
+    } finally {
+      setJevKeyBusy(false);
+    }
+  }
+  async function preparePrivateWork() {
+    const ledgerRevision = latestPrivateLedgerRevision();
+    const useLedger =
+      privateLedgerUse &&
+      ledgerRevision !== null &&
+      privateLedgerPhase === "idle";
+    const ledgerRevisionId = useLedger ? ledgerRevision?.revision : undefined;
+    if (
+      !privateWorkAvailable ||
+      !privatePublicTask.trim() ||
+      (!useLedger && !privateContext.trim()) ||
+      !session ||
+      phase === "loading" ||
+      phase === "preparing" ||
+      phase === "sending" ||
+      sessionMutation !== null ||
+      !factsConfirmed ||
+      !identityConfirmed ||
+      pendingReview !== null ||
+      privatePhase !== "idle" ||
+      privateCancelPending ||
+      !providerConfirmed ||
+      privateLedgerCandidate !== null ||
+      privateLedgerPhase !== "idle" ||
+      recoveryStatus === "unknown_send" ||
+      recoveryStatus === "storage_failed"
+    )
+      return;
+    if (preview || pendingReview) invalidate(false);
+    const attempt = ++generation.current;
+    const sessionId = session;
+    const publicTask = privatePublicTask;
+    const context = privateContext;
+    setPrivateError("");
+    setLatestJev(null);
+    setPrivatePreview(null);
+    setPrivatePhase("preparing");
+    try {
+      const result = await api<PrivateWorkPreview>(
+        `/sessions/${sessionId}/private-work/prepare`,
+        "POST",
+        {
+          public_task: publicTask,
+          private_context: useLedger ? "" : context,
+          jev_enabled: jevEnabled,
+          ...(ledgerRevisionId !== undefined
+            ? { ledger_revision: ledgerRevisionId }
+            : {}),
+        },
+      );
+      if (!validPrivatePreview(result))
+        throw new Error("PRIVATE_WORK_OUTCOME_UNKNOWN");
+      if (attempt !== generation.current || sessionId !== session) {
+        await discardPrivatePreview(sessionId, result.prepared_id).catch(
+          explainPrivate,
+        );
+        return;
+      }
+      setPrivatePreview(result);
+      setPrivatePhase("ready");
+    } catch (reason) {
+      if (attempt === generation.current) {
+        explainPrivate(reason);
+        setPrivatePhase("idle");
+      }
+    }
+  }
+  async function sendPrivateWork() {
+    const prepared = privatePreview;
+    if (
+      !prepared ||
+      privatePhase !== "ready" ||
+      phase !== "idle" ||
+      sessionMutation !== null ||
+      !session ||
+      !privateWorkAvailable ||
+      !providerConfirmed ||
+      !factsConfirmed ||
+      !identityConfirmed ||
+      pendingReview !== null
+    )
+      return;
+    const attempt = ++generation.current;
+    const sessionId = session;
+    setPrivateError("");
+    setPrivateCancelPending(false);
+    setPrivatePhase("sending");
+    let awaitingJev = false;
+    try {
+      const result = await api<{
+        answer?: string;
+        jev_preview?: PrivateWorkPreview;
+      }>(`/sessions/${sessionId}/private-work/send`, "POST", {
+        prepared_id: prepared.prepared_id,
+      });
+      if (result.jev_preview) {
+        const next = result.jev_preview;
+        if (
+          next.stage !== "jev" ||
+          next.provider !== "typesafe-jev" ||
+          !validPrivatePreview(next)
+        )
+          throw new Error("PRIVATE_WORK_OUTCOME_UNKNOWN");
+        if (attempt !== generation.current || sessionId !== session) {
+          await discardPrivatePreview(sessionId, next.prepared_id).catch(
+            explainPrivate,
+          );
+          return;
+        }
+        setPrivatePreview(next);
+        setPrivatePhase("ready");
+        awaitingJev = true;
+        return;
+      }
+      if (typeof result.answer !== "string")
+        throw new Error("PRIVATE_WORK_OUTCOME_UNKNOWN");
+      if (attempt !== generation.current || sessionId !== session) return;
+      await refresh(sessionId, false, attempt);
+      if (attempt !== generation.current || sessionId !== session) return;
+      setPrivatePublicTask("");
+      setPrivateContext("");
+    } catch (reason) {
+      if (attempt !== generation.current || sessionId !== session) return;
+      explainPrivate(reason);
+      await refresh(sessionId, false, attempt).catch(() => undefined);
+      if (attempt === generation.current && sessionId === session) {
+        const code =
+          reason instanceof Error ? reason.message : "REQUEST_FAILED";
+        setPrivateError(
+          errors[code] ??
+            "Chưa xác nhận được kết quả private work. Hãy kiểm tra lịch sử hoặc tạo phiên mới; không tự gửi lại.",
+        );
+      }
+    } finally {
+      if (attempt === generation.current && sessionId === session) {
+        if (!awaitingJev) {
+          setPrivatePreview(null);
+          setPrivatePhase("idle");
+        }
+        setPrivateCancelPending(false);
+      }
+    }
+  }
+  async function rerunPrivateLedger(workId: string) {
+    const revision = latestPrivateLedgerRevision();
+    if (
+      !workId ||
+      !revision ||
+      !session ||
+      phase !== "idle" ||
+      privatePhase !== "idle" ||
+      privateLedgerPhase !== "idle" ||
+      privateLedgerCandidate !== null ||
+      sessionMutation !== null ||
+      pendingReview !== null ||
+      recoveryStatus === "unknown_send" ||
+      recoveryStatus === "storage_failed"
+    )
+      return;
+    const attempt = ++generation.current;
+    const sessionId = session;
+    setPrivateError("");
+    setPrivateLedgerRerunPending(true);
+    setPrivatePhase("sending");
+    try {
+      const result = await api<{ answer: string }>(
+        `/sessions/${sessionId}/private-ledger/rerun`,
+        "POST",
+        { work_id: workId, ledger_revision: revision.revision },
+      );
+      if (typeof result.answer !== "string")
+        throw new Error("PRIVATE_WORK_OUTCOME_UNKNOWN");
+      if (attempt !== generation.current || sessionId !== session) return;
+      await refresh(sessionId, false, attempt);
+      if (attempt !== generation.current || sessionId !== session) return;
+      setPrivateError("Đã tính lại theo bản ghi local hiện tại.");
+    } catch (reason) {
+      if (attempt !== generation.current || sessionId !== session) return;
+      explainPrivate(reason);
+      await refresh(sessionId, false, attempt).catch(() => undefined);
+    } finally {
+      if (attempt === generation.current && sessionId === session) {
+        setPrivatePhase("idle");
+        setPrivateLedgerRerunPending(false);
+      }
+    }
+  }
+  async function cancelPrivateWork() {
+    if (privatePhase === "idle" || !session) return;
+    const sessionId = session;
+    const preparedId = privatePreview?.prepared_id;
+    const attempt = ++generation.current;
+    setPrivateCancelPending(true);
+    setPrivateError("");
+    try {
+      if (preparedId)
+        await api(`/sessions/${sessionId}/cancel`, "POST", {
+          prepared_id: preparedId,
+        });
+      if (attempt !== generation.current || sessionId !== session) return;
+      await refresh(sessionId, false, attempt);
+      if (attempt !== generation.current || sessionId !== session) return;
+      setPrivateError(
+        "Đã nhận xác nhận hủy. Hãy kiểm tra lịch sử; không tự gửi lại nếu kết quả vẫn chưa rõ.",
+      );
+    } catch (reason) {
+      if (attempt !== generation.current || sessionId !== session) return;
+      const code = reason instanceof Error ? reason.message : "REQUEST_FAILED";
+      const message =
+        errors[code] ??
+        "Chưa xác nhận được thao tác hủy. Hãy kiểm tra lịch sử; không tự gửi lại.";
+      await refresh(sessionId, false, attempt).catch(() => undefined);
+      if (attempt === generation.current && sessionId === session)
+        setPrivateError(message);
+    } finally {
+      if (attempt === generation.current && sessionId === session) {
+        setPrivatePreview(null);
+        setPrivatePhase("idle");
+        setPrivateCancelPending(false);
+      }
+    }
+  }
+  async function discardPrivateWork() {
+    const prepared = privatePreview;
+    if (!prepared || !session || privatePhase !== "ready") return;
+    const sessionId = session;
+    generation.current++;
+    setPrivatePreview(null);
+    setPrivatePhase("idle");
+    setPrivateError("");
+    try {
+      await discardPrivatePreview(sessionId, prepared.prepared_id);
+    } catch (reason) {
+      explainPrivate(reason);
+    }
+  }
   async function waitStreamCancellation() {
     await streamCancellation.current?.catch(() => {});
   }
   async function reviewPreview(candidateId?: string) {
     if (
+      (busy && !pendingReview) ||
       phase === "loading" ||
       phase === "preparing" ||
       phase === "sending" ||
       !session ||
       !identityConfirmed ||
       !factsConfirmed ||
-      !providerConfirmed
+      !providerConfirmed ||
+      privatePhase !== "idle" ||
+      privateCancelPending
     )
       return;
     if (
@@ -350,11 +1209,14 @@ export function useChatController() {
   }
   async function send() {
     if (
+      busy ||
       !preview ||
       phase !== "ready" ||
       !factsConfirmed ||
       !identityConfirmed ||
-      pendingReview
+      pendingReview ||
+      privatePhase !== "idle" ||
+      privateCancelPending
     )
       return;
     const streaming = preview.streaming === true;
@@ -606,71 +1468,146 @@ export function useChatController() {
   }
   async function reset() {
     if (busy || !identityConfirmed) return;
-    clearDraftIdentity();
+    const attempt = ++generation.current;
+    setSessionMutation({ kind: "new", status: "busy" });
     setPhase("loading");
     setError("");
-    generation.current++;
-    setPreview(null);
     try {
-      if (session) {
-        try {
-          await api(`/sessions/${session}`, "DELETE");
-        } catch (reason) {
-          if (
-            !(reason instanceof Error) ||
-            !["SESSION_NOT_FOUND", "AUTH_REQUIRED"].includes(reason.message)
-          )
-            throw reason;
-        }
-      }
-      setSession("");
-      setMessages([]);
-      setAudit([]);
-      const boot = await api<Bootstrap>("/bootstrap");
-      setCsrf(boot.csrf);
+      if (session) await waitForSessionDiscard(session);
+      if (attempt !== generation.current) return;
+      clearConversationDraft();
       const created = await api<SessionIdentity>("/sessions", "POST", {
-        provider: model ? provider : boot.provider,
-        model: model || boot.model,
+        ...(providerConfirmed ? { provider, model } : {}),
       });
-      setProvider(created.provider);
-      setModel(created.model);
-      setProviderConfirmed(true);
-      generation.current++;
+      if (attempt !== generation.current) return;
       setSession(created.id);
-      setMessages([]);
-      setDraft("");
-      setTerms("");
-      setFactState({
-        enabled: !!boot.state_enabled,
-        epoch: 0,
-        facts: [],
-        sources: [],
-        entities: [],
-      });
-      setFactsConfirmed(true);
-      setPreview(null);
-      setAudit([]);
+      await refresh(created.id, true);
+      await refreshSessions();
       setShowAudit(false);
+      setPhase("idle");
+      setSessionMutation(null);
     } catch (reason) {
       explain(reason);
-    } finally {
+      setSessionMutation({ kind: "new", status: "unknown" });
+      setPhase("idle");
+    }
+  }
+
+  async function openSession(id: string) {
+    if (!id || id === session || busy || !identityConfirmed) return;
+    const attempt = ++generation.current;
+    setSessionMutation({ kind: "switch", session_id: id, status: "busy" });
+    setPhase("loading");
+    setError("");
+    try {
+      if (session) await waitForSessionDiscard(session);
+      const state = await api<SessionView>(`/sessions/${id}`);
+      if (attempt !== generation.current) return;
+      clearConversationDraft();
+      setSession(id);
+      applySession(state, true);
+      setShowAudit(false);
+      setPhase("idle");
+      setSessionMutation(null);
+    } catch (reason) {
+      explain(reason);
+      setSessionMutation({ kind: "switch", session_id: id, status: "unknown" });
+      setPhase("idle");
+    }
+  }
+
+  async function renameSession(id: string, title: string) {
+    const nextTitle = title.trim();
+    if (!id || !nextTitle || busy || !identityConfirmed) return;
+    setSessionMutation({ kind: "rename", session_id: id, status: "busy" });
+    setError("");
+    try {
+      await api(`/sessions/${id}/title`, "POST", { title: nextTitle });
+      await refreshSessions();
+      if (id === session) setSessionTitle(nextTitle);
+      setSessionMutation(null);
+    } catch (reason) {
+      explain(reason);
+      setSessionMutation({ kind: "rename", session_id: id, status: "unknown" });
+    }
+  }
+
+  async function deleteSession(id: string) {
+    if (!id || busy || !identityConfirmed) return;
+    if (!window.confirm("Xóa cuộc trò chuyện này? Lịch sử sẽ bị xóa khỏi máy."))
+      return;
+    const deletingCurrent = id === session;
+    const attempt = ++generation.current;
+    setSessionMutation({ kind: "delete", session_id: id, status: "busy" });
+    setPhase("loading");
+    setError("");
+    try {
+      if (deletingCurrent) await waitForSessionDiscard(id);
+      await api(`/sessions/${id}`, "DELETE");
+      const remaining = await refreshSessions();
+      if (deletingCurrent) {
+        const next = latestSession(remaining);
+        if (next) {
+          const state = await api<SessionView>(`/sessions/${next.id}`);
+          if (attempt !== generation.current) return;
+          clearConversationDraft();
+          setSession(next.id);
+          applySession(state, true);
+        } else {
+          const created = await api<SessionIdentity>("/sessions", "POST", {
+            ...(providerConfirmed ? { provider, model } : {}),
+          });
+          if (attempt !== generation.current) return;
+          clearConversationDraft();
+          setSession(created.id);
+          await refresh(created.id, true);
+          await refreshSessions();
+        }
+        setShowAudit(false);
+      }
+      setPhase("idle");
+      setSessionMutation(null);
+    } catch (reason) {
+      explain(reason);
+      setSessionMutation({ kind: "delete", session_id: id, status: "unknown" });
       setPhase("idle");
     }
   }
   function useSample(sample: Sample) {
+    if (busy) return;
     invalidate();
+    if (privatePhase !== "idle") invalidatePrivatePreview();
     setDraft(sample.text);
     setTerms(sample.terms);
     input.current?.focus();
   }
 
   function changeDraft(text: string) {
+    if (busy) return;
     invalidate();
+    if (privatePhase !== "idle") invalidatePrivatePreview();
     setDraft(text);
   }
   function changeTerms(text: string) {
+    if (busy) return;
     invalidate();
+    if (privatePhase !== "idle") invalidatePrivatePreview();
     setTerms(text);
+  }
+  function changePrivatePublicTask(text: string) {
+    if (busy) return;
+    if (text === privatePublicTask) return;
+    if (phase !== "idle" || preview || pendingReview) invalidate(false);
+    invalidatePrivatePreview();
+    setPrivatePublicTask(text);
+  }
+  function changePrivateContext(text: string) {
+    if (busy) return;
+    if (text === privateContext) return;
+    if (phase !== "idle" || preview || pendingReview) invalidate(false);
+    invalidatePrivatePreview();
+    setPrivateLedgerUseState(false);
+    setPrivateContext(text);
   }
   function selectDraft(start: number, end: number) {
     setDraftSelection(selectedOccurrence(draft, start, end));
@@ -743,10 +1680,11 @@ export function useChatController() {
   }
   function closeProviders() {
     setShowProviders(false);
-    requestAnimationFrame(() => providerButton.current?.focus());
   }
   function semanticSample() {
+    if (busy) return;
     invalidate();
+    if (privatePhase !== "idle") invalidatePrivatePreview();
     setDraft(
       "Thông tin nội bộ, chưa công bố: dự án Aurora sẽ cắt giảm 30 nhân sự vào tháng 12. Soạn lời nhắn mời nhóm quản lý họp để trao đổi kế hoạch này.",
     );
@@ -764,6 +1702,12 @@ export function useChatController() {
       codex,
       localModel,
       session,
+      sessionTitle,
+      sessions,
+      persistenceEnabled,
+      sessionMutation,
+      recoveryStatus,
+      interruptedTurn,
       providerConfirmed,
       factState,
       factsConfirmed,
@@ -786,8 +1730,47 @@ export function useChatController() {
       showAudit,
       cancelPending,
       busy,
+      privateWorkAvailable,
+      jevEnabled,
+      jevConfigured,
+      jevKeyOpen,
+      jevKey,
+      jevKeyBusy,
+      latestJev,
+      privateWorkHistory,
+      privatePublicTask,
+      privateContext,
+      privatePhase,
+      privatePreview,
+      privateError,
+      privateCancelPending,
+      interruptedPrivateWork,
+      privateLedgerAvailable,
+      privateLedgerModelAvailable,
+      structuredLedgerDraft,
+      privateLedgerHistory,
+      privateLedgerSource,
+      privateLedgerPhase,
+      privateLedgerCandidate,
+      privateLedgerUse,
+      privateLedgerError,
+      privateLedgerNotice,
+      privateLedgerCancelPending,
+      privateLedgerRerunPending,
     },
     actions: {
+      toggleJev,
+      saveJevKey,
+      removeJevKey,
+      changeJevKey: (key: string) => {
+        if (!busy) setJevKey(key);
+      },
+      closeJevKey: () => {
+        if (!busy) {
+          setJevKeyOpen(false);
+          setJevKey("");
+        }
+      },
       selectProvider,
       prepare,
       reviewPreview,
@@ -805,13 +1788,36 @@ export function useChatController() {
       selectDraft,
       protectSelection,
       closeProviders,
+      openSession,
+      renameSession,
+      deleteSession,
       semanticSample,
       setInspect,
-      clearDraft: () => invalidate(),
+      clearDraft: () => {
+        if (busy) return;
+        invalidate();
+        if (privatePhase !== "idle") invalidatePrivatePreview();
+      },
       clearError: () => setError(""),
+      clearPrivateError: () => setPrivateError(""),
+      clearPrivateLedgerError: () => setPrivateLedgerError(""),
       openProviders: () => setShowProviders(true),
       toggleAudit: () => setShowAudit(!showAudit),
       openAudit: () => setShowAudit(true),
+      changePrivatePublicTask,
+      changePrivateContext,
+      preparePrivateWork,
+      sendPrivateWork,
+      rerunPrivateLedger,
+      cancelPrivateWork,
+      discardPrivateWork,
+      changePrivateLedgerSource,
+      proposePrivateLedger,
+      proposeStructuredLedger,
+      changeStructuredLedger,
+      confirmPrivateLedger,
+      discardPrivateLedger,
+      setPrivateLedgerUse,
     },
     elements: { bottom, input, providerButton },
   };

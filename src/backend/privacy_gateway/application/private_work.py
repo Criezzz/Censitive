@@ -5,14 +5,18 @@ import hashlib
 import json
 import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Protocol
+from typing import Literal, Protocol
 
+from privacy_gateway.adapters.jev import JevGate
 from privacy_gateway.adapters.provider import Provider, ProviderOptions, serialize_request
+from privacy_gateway.domain.jev import JevAssessment, jev_body
 from privacy_gateway.domain.private_plan import (
+    ComposePlan,
     ComputePlan,
     PlanInput,
+    execute_compose_plan,
     execute_compute_plan,
     lower_planner_plan,
     planner_output_schema,
@@ -39,8 +43,9 @@ dot for equal nonempty lists, and round(x,2) with half-even rounding. Constants 
 from the public task or mathematics. Do not ask local extraction to calculate intermediates.
 Output descriptor keys must be unique and match the requested public JSON keys.
 
-Use local_answer for summaries, classification, drafting, sorting, dates, nested content,
-arrays, objects, or unsupported operations. Its plan has instruction, output_format, and
+Use local_answer for tasks requiring semantic synthesis or operations that compute/compose
+cannot express, such as unrestricted summaries, classification or sorting. Its plan has
+instruction, output_format, and
 answer_fields. output_format text uses exactly one field
 {"name":"answer","type":"text","max_length":4000}. output_format json uses 1..8
 unique fields. Each field type is string with max_length, number, integer, boolean,
@@ -55,6 +60,20 @@ fields, use the explicit compatibility branch with output_format:"json",
 answer_contract:"unconstrained", and no answer_fields. That branch preserves the older local
 freeform route and carries no typed-shape guarantee; do not use it for a task that requires
 strict required-key enforcement when the typed shape is expressible.
+
+Use compose instead of local_answer when requested prose can be written as public templates
+filled with computed numbers and exact source quotes. A compose plan uses the same inputs
+and outputs descriptors as compute, plus render. Every template slot is {{output_name}} and
+must name a declared output, including a text output for each source quote needed in prose.
+For one unconditional template use render:{"kind":"template","text":"..."}.
+For a numeric comparison compute a signed difference output, then use
+render:{"kind":"sign","selector":"difference_output_name","negative":"...",
+"zero":"...","positive":"..."}. The selector must be a numeric output. Supply all three
+complete templates before knowing private values. Local code selects by the exact sign and
+fills slots once; it does not execute formatting, attributes, code or nested templates.
+Keep template prose public and task-faithful. Never invent private names or values, ask the
+worker to draft the answer, or put arithmetic/intermediate calculations in input instructions.
+Use local_answer only when the required reasoning cannot be expressed by these operations.
 
 The application validates the closed descriptor plan and then derives the local response
 schema. Do not add defaults, inactive fields, self-check envelopes, result fields, or repair
@@ -96,6 +115,24 @@ class PreparedWork:
     private_context: str = field(repr=False)
     body: bytes
     provider_signature: tuple[str, str, str]
+    stage: Literal["planner", "jev"] = "planner"
+    gate_signature: tuple[str, str, str] | None = None
+    public_plan: dict[str, object] | None = field(default=None, repr=False)
+    planner_body_sha256: str = ""
+
+
+class JevPreviewReady(Exception):
+    def __init__(self, work: PreparedWork) -> None:
+        self.work = work
+        super().__init__("JEV_PREVIEW_READY")
+
+
+class JevGateBlocked(PrivacyError):
+    def __init__(self, assessment: JevAssessment) -> None:
+        self.assessment = assessment
+        super().__init__(
+            "JEV_REJECTED" if assessment.decision == "reject" else "JEV_REVIEW_REQUIRED"
+        )
 
 
 @dataclass(frozen=True)
@@ -105,6 +142,7 @@ class WorkResult:
     public_body_sha256: str
     plan: dict[str, object]
     trace: tuple[str, ...]
+    jev: JevAssessment | None = None
 
 
 def public_plan_body(provider: Provider, public_task: str) -> bytes:
@@ -154,12 +192,20 @@ def decode_plan(answer: str) -> dict[str, object]:
 
 
 class PrivateWorkbench:
-    def __init__(self, planner: Provider, worker: PrivateWorker) -> None:
+    def __init__(
+        self, planner: Provider, worker: PrivateWorker, gate: JevGate | None = None
+    ) -> None:
         self.planner = planner
         self.worker = worker
+        self.gate = gate
+        self.latest_jev: JevAssessment | None = None
         self._pending: dict[str, PreparedWork] = {}
 
-    def _signature(self) -> tuple[str, str, str]:
+    def _signature(self, stage: str = "planner") -> tuple[str, str, str]:
+        if stage == "jev":
+            if self.gate is None:
+                raise PrivacyError("JEV_KEY_REQUIRED")
+            return self.gate.signature
         return (
             self.planner.provider_id,
             self.planner.model,
@@ -167,6 +213,8 @@ class PrivateWorkbench:
         )
 
     def prepare(self, public_task: str, private_context: str) -> PreparedWork:
+        if self.gate is not None:
+            self.gate.require_key()
         body = public_plan_body(self.planner, public_task)
         if not isinstance(private_context, str) or len(private_context) > 12000:
             raise PrivacyError("PRIVATE_CONTEXT_LIMIT")
@@ -177,7 +225,12 @@ class PrivateWorkbench:
         if len(self._pending) >= 100:
             raise PrivacyError("PRIVATE_WORK_LIMIT")
         work = PreparedWork(
-            secrets.token_hex(16), public_task, private_context, body, self._signature()
+            secrets.token_hex(16),
+            public_task,
+            private_context,
+            body,
+            self._signature(),
+            gate_signature=self.gate.signature if self.gate is not None else None,
         )
         self._pending[work.id] = work
         return work
@@ -190,10 +243,34 @@ class PrivateWorkbench:
         if work is None:
             raise PrivacyError("PRIVATE_WORK_NOT_FOUND")
         if (
-            work.provider_signature != self._signature()
+            work.provider_signature != self._signature(work.stage)
             or approved_body != work.body
-            or public_plan_body(self.planner, work.public_task) != work.body
+            or work.gate_signature != (self.gate.signature if self.gate is not None else None)
         ):
+            raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
+        if self.gate is not None:
+            self.gate.require_key()
+        if work.stage == "jev":
+            if self.gate is None or work.public_plan is None:
+                raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
+            if jev_body(work.public_task, work.public_plan) != work.body:
+                raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
+            assessment = await self.gate.assess(work.body)
+            self.latest_jev = assessment
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise PrivacyError("CANCELLED")
+            if assessment.decision != "pass":
+                raise JevGateBlocked(assessment)
+            result = await execute_local_plan(
+                work.public_plan,
+                self.worker,
+                public_task=work.public_task,
+                private_context=work.private_context,
+                public_body_sha256=work.planner_body_sha256,
+            )
+            return replace(result, jev=assessment, trace=(*result.trace, "jev_public_plan_pass"))
+        if public_plan_body(self.planner, work.public_task) != work.body:
             raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
         try:
             async with asyncio.timeout(self.planner.timeout):
@@ -201,46 +278,89 @@ class PrivateWorkbench:
         except TimeoutError:
             raise PrivacyError("PRIVATE_PLANNER_TIMEOUT") from None
         raw = decode_plan(response)
-        raw_plan = raw.get("plan")
-        unconstrained = (
-            type(raw_plan) is dict and raw_plan.get("answer_contract") == "unconstrained"
-        )
-        lowered = lower_planner_plan(raw) if "plan" in raw else raw
-        plan = validate_plan(lowered)
-        trace: tuple[str, ...]
-        if isinstance(plan, ComputePlan):
-            values = (
-                await self.worker.extract(work.public_task, work.private_context, plan.inputs)
-                if plan.inputs
-                else {}
+        if self.gate is not None:
+            body = jev_body(work.public_task, raw)
+            validate_bound_plan = getattr(self.worker, "validate_plan", None)
+            if callable(validate_bound_plan):
+                validate_bound_plan(validate_plan(lower_planner_plan(raw)))
+            next_work = PreparedWork(
+                secrets.token_hex(16),
+                work.public_task,
+                work.private_context,
+                body,
+                self._signature("jev"),
+                stage="jev",
+                gate_signature=work.gate_signature,
+                public_plan=raw,
+                planner_body_sha256=hashlib.sha256(work.body).hexdigest(),
             )
-            answer = serialize_result(execute_compute_plan(plan, values))
-            trace = ("public_plan_sent", "plan_validated", "local_inputs_grounded", "local_compute")
-        else:
-            if plan.output_schema is None:
-                answer = await self.worker.answer(
-                    work.public_task, work.private_context, plan.instruction, plan.output_format
-                )
-                trace = (
-                    "public_plan_sent",
-                    "plan_validated",
-                    "local_answer_unconstrained" if unconstrained else "local_answer",
-                )
-            else:
-                answer = await self.worker.answer(
-                    work.public_task,
-                    work.private_context,
-                    plan.instruction,
-                    plan.output_format,
-                    output_schema=plan.output_schema,
-                )
-                answer = validate_local_answer_result(plan, answer)
-                trace = (
-                    "public_plan_sent",
-                    "plan_validated",
-                    "local_answer",
-                    "local_answer_shape_validated",
-                )
-        return WorkResult(
-            answer, plan.kind, hashlib.sha256(work.body).hexdigest(), raw, (*trace, "local_result")
+            self._pending[next_work.id] = next_work
+            raise JevPreviewReady(next_work)
+        return await execute_local_plan(
+            raw,
+            self.worker,
+            public_task=work.public_task,
+            private_context=work.private_context,
+            public_body_sha256=hashlib.sha256(work.body).hexdigest(),
         )
+
+
+async def execute_local_plan(
+    raw: dict[str, object],
+    worker: PrivateWorker,
+    *,
+    public_task: str,
+    private_context: str,
+    public_body_sha256: str,
+    reused: bool = False,
+) -> WorkResult:
+    if not re.fullmatch(r"[0-9a-f]{64}", public_body_sha256):
+        raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
+    origin = "saved_public_plan" if reused else "public_plan_sent"
+    raw_plan = raw.get("plan")
+    unconstrained = type(raw_plan) is dict and raw_plan.get("answer_contract") == "unconstrained"
+    lowered = lower_planner_plan(raw) if "plan" in raw else raw
+    plan = validate_plan(lowered)
+    validate_bound_plan = getattr(worker, "validate_plan", None)
+    if callable(validate_bound_plan):
+        validate_bound_plan(plan)
+    trace: tuple[str, ...]
+    if isinstance(plan, (ComposePlan, ComputePlan)):
+        computation = plan.compute if isinstance(plan, ComposePlan) else plan
+        values = (
+            await worker.extract(public_task, private_context, computation.inputs)
+            if computation.inputs
+            else {}
+        )
+        trace = (origin, "plan_validated", "local_inputs_grounded", "local_compute")
+        if isinstance(plan, ComposePlan):
+            answer = execute_compose_plan(plan, values)
+            trace += ("local_template_rendered",)
+        else:
+            answer = serialize_result(execute_compute_plan(plan, values))
+    else:
+        if plan.output_schema is None:
+            answer = await worker.answer(
+                public_task, private_context, plan.instruction, plan.output_format
+            )
+            trace = (
+                origin,
+                "plan_validated",
+                "local_answer_unconstrained" if unconstrained else "local_answer",
+            )
+        else:
+            answer = await worker.answer(
+                public_task,
+                private_context,
+                plan.instruction,
+                plan.output_format,
+                output_schema=plan.output_schema,
+            )
+            answer = validate_local_answer_result(plan, answer)
+            trace = (
+                origin,
+                "plan_validated",
+                "local_answer",
+                "local_answer_shape_validated",
+            )
+    return WorkResult(answer, plan.kind, public_body_sha256, raw, (*trace, "local_result"))

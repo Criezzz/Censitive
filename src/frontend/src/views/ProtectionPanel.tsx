@@ -17,7 +17,11 @@ export function ProtectionPanel(props: PanelProps) {
   const { correctFact, changeIdentity, stageIdentity, stageFact, clearDraft } =
     props.actions;
   return (
-    <section id="protected-info" aria-label="Thông tin được bảo vệ">
+    <section
+      id="protected-info"
+      aria-label="Thông tin được bảo vệ"
+      tabIndex={-1}
+    >
       <h2 className="protected-heading">Thông tin được bảo vệ</h2>
       <FactPanel
         key={session}

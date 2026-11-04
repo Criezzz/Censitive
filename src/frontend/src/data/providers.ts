@@ -1,5 +1,6 @@
 export function providerName(id: string): string {
   if (id === "codex-chatgpt") return "Codex";
+  if (id === "antigravity-google") return "Antigravity";
   if (id === "openai-api") return "OpenAI API";
   if (id === "local-qwen") return "Qwen local";
   return "Demo local";
@@ -9,6 +10,13 @@ export function providerBadge(id: string): string {
   return id === "codex-chatgpt" ? "Codex · ChatGPT" : providerName(id);
 }
 
+export type QuotaBucket = {
+  group: string;
+  window: string;
+  remaining_fraction: number;
+  reset_time: string;
+};
+
 export type ProviderChoice = {
   id: string;
   name: string;
@@ -16,6 +24,8 @@ export type ProviderChoice = {
   auth: string;
   status: string;
   code: string;
+  authenticated?: boolean;
+  quota?: QuotaBucket[];
 };
 export type Catalog = { providers: ProviderChoice[] };
 export type Request = <T>(
@@ -42,4 +52,23 @@ export const connectionMessages: Record<string, string> = {
     "Phiên đã thay đổi trong lúc kiểm tra kết nối. Hãy đóng hộp này rồi kiểm tra lại.",
   AUTH_REQUIRED:
     "Kết nối ứng dụng đã hết hiệu lực. Đóng hộp này và tạo phiên mới.",
+  ANTIGRAVITY_NOT_FOUND:
+    "Chưa tìm thấy Antigravity CLI trên máy. Cài CLI chính thức rồi kiểm tra lại.",
+  NOT_FOUND:
+    "Chưa tìm thấy Antigravity CLI trên máy. Cài CLI chính thức rồi kiểm tra lại.",
+  ANTIGRAVITY_VERSION_UNVERIFIED:
+    "Phiên bản Antigravity CLI này chưa được kiểm chứng với gateway. Kết nối chat đang bị khóa.",
+  VERSION_UNVERIFIED:
+    "Phiên bản Antigravity CLI này chưa được kiểm chứng với gateway. Kết nối chat đang bị khóa.",
+  ANTIGRAVITY_BOUNDARY_UNVERIFIED:
+    "Tài khoản Google đã được nhận diện, nhưng cách ly context/tools của Antigravity chưa được kiểm chứng.",
+  ANTIGRAVITY_CONNECTION_FAILED:
+    "Không thể kiểm tra kết nối Antigravity trên máy.",
+  ANTIGRAVITY_METADATA_FAILED: "Không thể đọc metadata Antigravity từ CLI.",
+  ANTIGRAVITY_METADATA_TIMEOUT:
+    "Antigravity CLI hết thời gian trả về metadata.",
+  ANTIGRAVITY_METADATA_OUTPUT_LIMIT:
+    "Metadata Antigravity vượt giới hạn cho phép.",
+  ANTIGRAVITY_METADATA_INVALID:
+    "Metadata Antigravity không đúng định dạng được kiểm chứng.",
 };

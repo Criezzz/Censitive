@@ -5,7 +5,9 @@ import { SessionPanel } from "./views/SessionPanel";
 import { ProviderHeader } from "./views/ProviderHeader";
 import { ChatPanel } from "./views/ChatPanel";
 import { PrivacyPanel } from "./views/PrivacyPanel";
-import { Shield } from "./views/Shield";
+import { PrivateWorkPanel } from "./views/PrivateWorkPanel";
+import { WorkflowPanel } from "./views/WorkflowPanel";
+import { getWorkflowStatus } from "./controllers/workspace";
 
 export function App() {
   const chat = useChatController();
@@ -25,20 +27,12 @@ export function App() {
       <SessionPanel {...chat} />
       <main className="workspace" id="main-content">
         <ProviderHeader {...chat} />
-        <div className="demo-strip">
-          <Shield small />
-          <span>
-            <strong>Bạn kiểm soát bản gửi.</strong> Xem nội dung đã che và duyệt
-            trước mỗi lượt.
-          </span>
-          <span className="strip-right">
-            01 Chuẩn bị <i>→</i> 02 Duyệt <i>→</i> 03 Nhận
-          </span>
-        </div>
+        <WorkflowPanel status={getWorkflowStatus(chat.model)} />
         <nav className="panel-links" aria-label="Các khu vực làm việc">
           <a href="#chat-panel">Hội thoại</a>
           <a href="#privacy-panel">Kiểm tra bản gửi</a>
           <a href="#protected-info">Thông tin được bảo vệ</a>
+          <a href="#private-work-panel">Private work local</a>
           <a href="#provider-session">Provider và phiên</a>
           <a href="#session-audit" onClick={chat.actions.openAudit}>
             Nhật ký phiên
@@ -48,6 +42,7 @@ export function App() {
           <ChatPanel {...chat} />
           <PrivacyPanel {...chat} />
         </div>
+        <PrivateWorkPanel {...chat} />
       </main>
     </div>
   );

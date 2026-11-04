@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import inspect
 import json
 import re
 import secrets
@@ -22,16 +24,27 @@ from privacy_gateway.adapters.conversation_store import (
     ConversationStoreError,
     EncryptedConversationStore,
 )
+from privacy_gateway.adapters.jev import JevGate
 from privacy_gateway.adapters.provider import StreamingProvider
-from privacy_gateway.application.gateway import Gateway, Prepared, Session
+from privacy_gateway.application.gateway import (
+    MAX_BODY,
+    Gateway,
+    Prepared,
+    Session,
+)
+from privacy_gateway.application.private_work import PreparedWork, PrivateWorkbench
 from privacy_gateway.application.session_records import EncryptedSessionRepository
 from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand
+from privacy_gateway.domain.jev import JevAssessment
+from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES
 from privacy_gateway.domain.manual_facts import CreateFact, DraftFacts
 from privacy_gateway.domain.models import SpanValidationError
 from privacy_gateway.domain.preview_review import RejectNewMask, review_items
+from privacy_gateway.domain.private_ledger import LedgerRevision, NoLedgerChanges
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.serialization import strict_json
 from privacy_gateway.domain.state import State
+from privacy_gateway.domain.structured_ledger import StructuredLedgerValues
 
 
 class StrictInput(BaseModel):
@@ -63,6 +76,38 @@ class PrepareInput(StrictInput):
 
 class SnapshotInput(StrictInput):
     prepared_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
+
+
+class PrivateWorkPrepareInput(StrictInput):
+    public_task: str = Field(min_length=1, max_length=3_000)
+    private_context: str = Field(max_length=12_000)
+    ledger_revision: int | None = Field(default=None, ge=1, le=32)
+    jev_enabled: bool = False
+
+
+class JevKeyInput(StrictInput):
+    key: str = Field(min_length=1, max_length=4096, repr=False)
+
+
+class PrivateLedgerProposeInput(StrictInput):
+    private_source: str = Field(min_length=1, max_length=4_000)
+    base_revision: int = Field(default=0, ge=0, le=32)
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class PrivateLedgerConfirmInput(StrictInput):
+    proposal_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class PrivateLedgerStructuredInput(StrictInput):
+    values: StructuredLedgerValues
+    base_revision: int = Field(default=0, ge=0, le=32)
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class PrivateLedgerRerunInput(StrictInput):
+    work_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    ledger_revision: int = Field(ge=1, le=32)
 
 
 class CorrectionInput(StrictInput):
@@ -145,6 +190,36 @@ def state_view(state: State, enabled: bool) -> dict[str, object]:
     }
 
 
+def ledger_revision_view(revision: LedgerRevision) -> dict[str, object]:
+    return {
+        "revision": revision.revision,
+        "parent_revision": revision.parent_revision,
+        "origin": revision.origin,
+        "source_sha256": revision.source_sha256,
+        "events": [event.model_dump(mode="json") for event in revision.events],
+        "records": [
+            {
+                "amount_id": item.amount_id,
+                "label": item.label,
+                "amount": str(item.amount),
+                "source_quote": item.source_quote,
+                "active": item.active,
+            }
+            for item in revision.records
+        ],
+        "effective": {
+            "active_amounts": [str(item.amount) for item in revision.records if item.active],
+            "surcharge_percent": (
+                None if revision.surcharge_percent is None else str(revision.surcharge_percent)
+            ),
+            "budget": None if revision.budget is None else str(revision.budget),
+            "recipient": revision.recipient,
+            "project": revision.project,
+            "unit": revision.unit,
+        },
+    }
+
+
 class ProviderInput(StrictInput):
     provider: str = Field(min_length=1, max_length=50)
     model: str = Field(min_length=1, max_length=100)
@@ -181,6 +256,7 @@ def create_app(
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.gateway = service
+    jev_gates: dict[str, JevGate] = {}
     clients: dict[str, str] = {}
     known_owners: set[str] = set()
     if conversation_store is not None:
@@ -219,9 +295,30 @@ def create_app(
             ):
                 return JSONResponse({"code": "AUTH_REQUIRED"}, status_code=403)
             prepare_path = re.fullmatch(r"/api/sessions/([0-9a-f]{32})/prepare", request.url.path)
+            private_prepare_path = re.fullmatch(
+                r"/api/sessions/([0-9a-f]{32})/private-work/prepare", request.url.path
+            )
+            ledger_propose_path = re.fullmatch(
+                r"/api/sessions/([0-9a-f]{32})/private-ledger/propose(?:-structured)?",
+                request.url.path,
+            )
             if request.method == "POST" and prepare_path:
                 try:
                     service.discard(service.session(prepare_path[1], owner))
+                except PrivacyError as error:
+                    return JSONResponse({"code": str(error)}, status_code=409)
+            if request.method == "POST" and private_prepare_path:
+                try:
+                    service.discard(service.session(private_prepare_path[1], owner))
+                except PrivacyError as error:
+                    return JSONResponse({"code": str(error)}, status_code=409)
+            if request.method == "POST" and ledger_propose_path:
+                try:
+                    session = service.session(ledger_propose_path[1], owner)
+                    if session.prepared is not None or session.private_prepared is not None:
+                        service.discard(session)
+                    else:
+                        service._drop_ledger_candidate(session)  # noqa: SLF001
                 except PrivacyError as error:
                     return JSONResponse({"code": str(error)}, status_code=409)
             command_path = re.fullmatch(
@@ -305,6 +402,9 @@ def create_app(
         command_path = re.fullmatch(
             r"/api/sessions/([0-9a-f]{32})/(?:identity|facts/(?:correct|create))", request.url.path
         )
+        private_prepare_path = re.fullmatch(
+            r"/api/sessions/([0-9a-f]{32})/private-work/prepare", request.url.path
+        )
         review_path = re.fullmatch(
             r"/api/sessions/([0-9a-f]{32})/prepared/([0-9a-f]{32})/decisions", request.url.path
         )
@@ -318,6 +418,11 @@ def create_app(
                 service.discard(service.session(command_path[1], owner(request)))
             except PrivacyError as error:
                 return JSONResponse({"code": str(error)}, status_code=409)
+        if request.method == "POST" and private_prepare_path:
+            try:
+                service.discard(service.session(private_prepare_path[1], owner(request)))
+            except PrivacyError as error:
+                return JSONResponse({"code": str(error)}, status_code=409)
         return JSONResponse({"code": "INVALID_INPUT"}, status_code=422)
 
     def owner(request: Request) -> str:
@@ -325,6 +430,35 @@ def create_app(
         if value not in clients:
             raise PrivacyError("AUTH_REQUIRED")
         return value
+
+    def private_work_available(session: Session) -> bool:
+        if service.private_worker is None:
+            return False
+        checker = getattr(connections, "private_work_available", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(session.provider))
+        except (PrivacyError, OSError, ValueError, TypeError):
+            return False
+
+    async def private_workbench(session: Session) -> PrivateWorkbench:
+        factory = getattr(connections, "private_work", None)
+        if service.private_worker is None or not callable(factory):
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        try:
+            result = factory(session.provider, service.private_worker)
+            if inspect.isawaitable(result):
+                result = await result
+        except PrivacyError:
+            raise
+        except (OSError, ValueError, TypeError):
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE") from None
+        if result is None:
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        if not isinstance(result, PrivateWorkbench):
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        return result
 
     @app.get("/api/bootstrap")
     async def bootstrap(request: Request) -> JSONResponse:
@@ -367,6 +501,39 @@ def create_app(
         )
         return response
 
+    @app.get("/api/jev")
+    async def jev_status(request: Request) -> dict[str, bool]:
+        return {"configured": owner(request) in jev_gates}
+
+    def revoke_jev(client_owner: str) -> None:
+        sessions = service.list_sessions(client_owner)
+        if any(session.busy for session in sessions):
+            raise PrivacyError("SESSION_BUSY")
+        previous = jev_gates.pop(client_owner, None)
+        if previous is not None:
+            previous.revoke()
+        for session in sessions:
+            if session.private_workbench is not None and session.private_workbench.gate is not None:
+                service._drop_private_preview(session)
+
+    @app.post("/api/jev")
+    async def configure_jev(data: JevKeyInput, request: Request) -> dict[str, bool]:
+        client_owner = owner(request)
+        gate = JevGate(data.key)
+        revoke_jev(client_owner)
+        jev_gates[client_owner] = gate
+        return {"configured": True}
+
+    @app.delete("/api/jev")
+    async def remove_jev(request: Request) -> dict[str, bool]:
+        revoke_jev(owner(request))
+        return {"configured": False}
+
+    def jev_view(assessment: JevAssessment | None) -> dict[str, object] | None:
+        if assessment is None:
+            return None
+        return {**assessment.model_dump(), "estimated_usd": assessment.estimated_usd}
+
     @app.post("/api/sessions")
     async def create_session(data: CreateSessionInput, request: Request) -> dict[str, str]:
         client_owner = owner(request)
@@ -388,6 +555,7 @@ def create_app(
                     "message_count": len(session.private_history),
                     "provider_confirmed": session.provider_confirmed,
                     "recovery_status": session.recovery_status,
+                    "private_work_count": len(session.private_work_history),
                 }
                 for session in service.list_sessions(owner(request))
             ]
@@ -408,6 +576,14 @@ def create_app(
     async def check_connection(data: StrictInput, request: Request) -> dict[str, object]:
         owner(request)
         await connections.check()
+        return {"providers": connections.catalog()}
+
+    @app.post("/api/providers/antigravity/check")
+    async def check_antigravity_connection(
+        data: StrictInput, request: Request
+    ) -> dict[str, object]:
+        owner(request)
+        await connections.check_antigravity()
         return {"providers": connections.catalog()}
 
     @app.post("/api/providers/codex/login")
@@ -440,16 +616,26 @@ def create_app(
     @app.get("/api/sessions/{session_id}")
     async def get_session(session_id: str, request: Request) -> dict[str, object]:
         session = service.session(session_id, owner(request))
+        marker = session.send_marker
+        interrupted = None
+        interrupted_private = None
+        if marker is not None:
+            if marker.kind == "private_work":
+                interrupted_private = {
+                    "id": marker.prepared_id,
+                    "public_task": marker.public_task,
+                    "private_context": marker.private_context,
+                    "status": "unknown",
+                }
+            else:
+                interrupted = {"text": marker.original, "status": "unknown"}
         return {
             "id": session.id,
             "title": session.title,
             "provider_confirmed": session.provider_confirmed,
             "recovery_status": session.recovery_status,
-            "interrupted_turn": (
-                {"text": session.send_marker.original, "status": "unknown"}
-                if session.send_marker is not None
-                else None
-            ),
+            "interrupted_turn": interrupted,
+            "interrupted_private_work": interrupted_private,
             "provider": session.provider.provider_id,
             "model": session.provider.model,
             "messages": [
@@ -458,6 +644,30 @@ def create_app(
             ],
             "terms": session.terms,
             "busy": session.busy,
+            "private_work_available": private_work_available(session),
+            "latest_jev": jev_view(session.latest_jev),
+            "private_ledger_available": True,
+            "private_ledger_model_available": service.private_ledger_available(session),
+            "private_ledger_history": [
+                ledger_revision_view(item) for item in session.private_ledger_history
+            ],
+            "private_work_history": [
+                {
+                    "id": item.id,
+                    "public_task": item.public_task,
+                    "private_context": item.private_context,
+                    "answer": item.answer,
+                    "route": item.route,
+                    "public_body_sha256": item.public_body_sha256,
+                    "provider": item.provider,
+                    "model": item.model,
+                    "trace": list(item.trace),
+                    "ledger_revision": item.ledger_revision,
+                    "jev": jev_view(item.jev),
+                    "plan": item.plan if item.ledger_revision is not None else None,
+                }
+                for item in session.private_work_history
+            ],
             "audit": session.audit,
             "state": state_view(session.state, service.resolver is not None),
         }
@@ -509,7 +719,65 @@ def create_app(
         )
         return state_view(session.state, True)
 
+    @app.post("/api/sessions/{session_id}/private-ledger/propose")
+    async def propose_private_ledger(
+        session_id: str, data: PrivateLedgerProposeInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        pending = await service.propose_private_ledger(
+            session, data.private_source, data.base_revision, data.request_id
+        )
+        if pending is NoLedgerChanges.NO_CHANGES:
+            return {"status": "no_changes", "base_revision": data.base_revision}
+        return {
+            "proposal_id": pending.id,
+            "base_revision": pending.base_revision,
+            "session_version": pending.session_version,
+            "candidate": ledger_revision_view(pending.candidate),
+        }
+
+    @app.post("/api/sessions/{session_id}/private-ledger/propose-structured")
+    async def propose_structured_ledger(
+        session_id: str, data: PrivateLedgerStructuredInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        pending = await service.propose_private_ledger(
+            session, "", data.base_revision, data.request_id, structured_values=data.values
+        )
+        if pending is NoLedgerChanges.NO_CHANGES:
+            return {"status": "no_changes", "base_revision": data.base_revision}
+        return {
+            "proposal_id": pending.id,
+            "base_revision": pending.base_revision,
+            "session_version": pending.session_version,
+            "candidate": ledger_revision_view(pending.candidate),
+        }
+
+    @app.post("/api/sessions/{session_id}/private-ledger/confirm")
+    async def confirm_private_ledger(
+        session_id: str, data: PrivateLedgerConfirmInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        revision = service.confirm_private_ledger(session, data.proposal_id)
+        return {
+            "ok": True,
+            "revision": revision.revision,
+            "ledger": [ledger_revision_view(item) for item in session.private_ledger_history],
+        }
+
+    @app.post("/api/sessions/{session_id}/private-ledger/rerun")
+    async def rerun_private_ledger(
+        session_id: str, data: PrivateLedgerRerunInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        answer = await service.rerun_private_ledger(session, data.work_id, data.ledger_revision)
+        return {
+            "answer": answer,
+            "ledger_revision": data.ledger_revision,
+        }
+
     def preview_view(prepared: Prepared, session: Session) -> dict[str, object]:
+        message_count = len(json.loads(prepared.body)["messages"])
         return {
             "id": prepared.id,
             "sanitized": prepared.sanitized,
@@ -525,7 +793,17 @@ def create_app(
                 }
                 for d in prepared.detections
             ],
-            "history_count": len(session.provider_history),
+            "history_count": message_count - 1,
+            "context": {
+                "mode": "full_history",
+                "message_count": message_count,
+                "omitted_messages": 0,
+                "body_bytes": len(prepared.body),
+                "body_limit_bytes": MAX_BODY,
+                "archive_messages": len(session.private_history),
+                "archive_limit_messages": MAX_HISTORY_MESSAGES,
+                "input_tokens": None,
+            },
             "streaming": isinstance(session.provider, StreamingProvider),
             "review": None
             if prepared.review_plan is None
@@ -576,6 +854,61 @@ def create_app(
             draft_facts=data.draft_facts,
         )
         return preview_view(prepared, session)
+
+    @app.post("/api/sessions/{session_id}/private-work/prepare")
+    async def prepare_private_work(
+        session_id: str, data: PrivateWorkPrepareInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        if session.busy or session.preparing_id is not None:
+            raise PrivacyError("SESSION_BUSY")
+        if data.ledger_revision is not None and data.private_context != "":
+            raise PrivacyError("LEDGER_CONTEXT_CONFLICT")
+        version = session.version
+        signature = (
+            session.provider.provider_id,
+            session.provider.model,
+            session.provider.serializer_version,
+        )
+        workbench = await private_workbench(session)
+        gate = jev_gates.get(owner(request)) if data.jev_enabled else None
+        if data.jev_enabled and gate is None:
+            raise PrivacyError("JEV_KEY_REQUIRED")
+        workbench = PrivateWorkbench(workbench.planner, workbench.worker, gate)
+        session = service.session(session_id, owner(request))
+        work = service.prepare_private_work(
+            session,
+            workbench,
+            data.public_task,
+            data.private_context,
+            expected_version=version,
+            expected_signature=signature,
+            ledger_revision=data.ledger_revision,
+        )
+        return private_preview_view(work, session)
+
+    def private_preview_view(work: PreparedWork, session: Session) -> dict[str, object]:
+        return {
+            "prepared_id": work.id,
+            "public_task": work.public_task,
+            "public_body": work.body.decode("utf-8"),
+            "public_body_sha256": hashlib.sha256(work.body).hexdigest(),
+            "provider": work.provider_signature[0],
+            "model": work.provider_signature[1],
+            "stage": work.stage,
+            "jev_enabled": work.gate_signature is not None,
+            "ledger_revision": session.private_prepared_ledger_revision,
+        }
+
+    @app.post("/api/sessions/{session_id}/private-work/send")
+    async def send_private_work(
+        session_id: str, data: SnapshotInput, request: Request
+    ) -> dict[str, object]:
+        session = service.session(session_id, owner(request))
+        result = await service.send_private_work(session, data.prepared_id)
+        if session.private_prepared is not None and session.private_prepared.stage == "jev":
+            return {"jev_preview": private_preview_view(session.private_prepared, session)}
+        return {"answer": result}
 
     @app.post("/api/sessions/{session_id}/prepared/{prepared_id}/decisions")
     async def review_preview(

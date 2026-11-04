@@ -374,6 +374,19 @@ def _numeric_decimal(quote: str, number_format: str = "auto") -> Decimal:
 
 
 def _check_number_boundary(context: str, start: int, end: int, quote: str) -> None:
+    for index, direction, parenthesis in ((start - 1, -1, "("), (end, 1, ")")):
+        while 0 <= index < len(context) and (
+            context[index].isspace() or unicodedata.category(context[index]) == "Sc"
+        ):
+            index += direction
+        if 0 <= index < len(context):
+            character = context[index]
+            if (
+                character == parenthesis
+                or (character != "_" and character in _UNICODE_SIGN_CHARS)
+                or unicodedata.category(character) == "Pd"
+            ):
+                raise PrivacyError("PRIVATE_QUOTE_UNGROUNDED")
     for index in (start - 1, end):
         if not 0 <= index < len(context):
             continue
@@ -386,26 +399,8 @@ def _check_number_boundary(context: str, start: int, end: int, quote: str) -> No
             raise PrivacyError("PRIVATE_QUOTE_UNGROUNDED")
         if character not in ".,":
             continue
-        if character == ".":
-            neighbour_index = index + 1 if index == end else index - 1
-            neighbour = context[neighbour_index] if 0 <= neighbour_index < len(context) else ""
-            if neighbour.isdigit():
-                raise PrivacyError("PRIVATE_QUOTE_UNGROUNDED")
-            continue
-        if index == end:
-            cursor = index + 1
-            while cursor < len(context) and context[cursor].isdigit():
-                cursor += 1
-            run = cursor - index - 1
-            if run:
-                raise PrivacyError("PRIVATE_QUOTE_UNGROUNDED")
-        else:
-            cursor = index - 1
-            while cursor >= 0 and context[cursor].isdigit():
-                cursor -= 1
-            run = index - cursor - 1
-            if run:
-                raise PrivacyError("PRIVATE_QUOTE_UNGROUNDED")
+        if index < start or (index + 1 < len(context) and context[index + 1].isdigit()):
+            raise PrivacyError("PRIVATE_QUOTE_UNGROUNDED")
 
 
 def _valid_implicit_number_occurrences(

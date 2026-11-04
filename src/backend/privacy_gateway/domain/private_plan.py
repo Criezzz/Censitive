@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import (
@@ -31,6 +32,9 @@ MAX_ROUND_DIGITS = 12
 MAX_FRACTION_DIGITS = 256
 MAX_FRACTION_BITS = 1_024
 MAX_OUTPUT_BYTES = 8_192
+MAX_TEMPLATE_BYTES = 8_192
+MAX_TEMPLATE_SLOTS = 64
+MAX_RENDER_BYTES = MAX_TEMPLATE_BYTES * 3
 MAX_LOCAL_SCHEMA_FIELDS = 8
 MAX_LOCAL_SCHEMA_REQUIRED = 8
 MAX_LOCAL_SCHEMA_CHARS = 4_000
@@ -87,6 +91,32 @@ class ComputePlan:
 
 
 @dataclass(frozen=True)
+class TemplateRender:
+    kind: Literal["template"]
+    text: str
+
+
+@dataclass(frozen=True)
+class SignRender:
+    kind: Literal["sign"]
+    selector: str
+    negative: str
+    zero: str
+    positive: str
+
+
+type ComposeRender = TemplateRender | SignRender
+
+
+@dataclass(frozen=True)
+class ComposePlan:
+    version: Literal[3]
+    kind: Literal["compose"]
+    compute: ComputePlan
+    render: ComposeRender
+
+
+@dataclass(frozen=True)
 class LocalAnswerPlan:
     version: Literal[1, 3]
     kind: Literal["local_answer"]
@@ -95,7 +125,7 @@ class LocalAnswerPlan:
     output_schema: dict[str, Any] | None = None
 
 
-type TypedPlan = ComputePlan | LocalAnswerPlan
+type TypedPlan = ComputePlan | ComposePlan | LocalAnswerPlan
 
 _SCALAR_OPS = {"add", "sub", "mul", "div"}
 _AGGREGATE_OPS = {"sum", "mean", "min", "max"}
@@ -110,6 +140,7 @@ _ALL_OPS = {
     "dot",
 }
 _NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+_SLOT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 
 
 def planner_output_schema() -> dict[str, Any]:
@@ -240,11 +271,65 @@ def planner_output_schema() -> dict[str, Any]:
         },
         "required": ["version", "kind", "inputs", "outputs"],
     }
+    template_render = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "const": "template"},
+            "text": {"type": "string", "minLength": 1, "maxLength": MAX_TEMPLATE_BYTES},
+        },
+        "required": ["kind", "text"],
+    }
+    sign_render = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "const": "sign"},
+            "selector": {"type": "string", "minLength": 1, "maxLength": MAX_NAME_LENGTH},
+            "negative": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_TEMPLATE_BYTES,
+            },
+            "zero": {"type": "string", "minLength": 1, "maxLength": MAX_TEMPLATE_BYTES},
+            "positive": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_TEMPLATE_BYTES,
+            },
+        },
+        "required": ["kind", "selector", "negative", "zero", "positive"],
+    }
+    compose_plan = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "version": {"type": "integer", "const": 3},
+            "kind": {"type": "string", "const": "compose"},
+            "inputs": {"type": "array", "maxItems": MAX_INPUTS, "items": input_item},
+            "outputs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_OUTPUTS,
+                "items": output_item,
+            },
+            "render": {"anyOf": [template_render, sign_render]},
+        },
+        "required": ["version", "kind", "inputs", "outputs", "render"],
+    }
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "plan": {"anyOf": [compute_plan, local_text_plan, local_json_plan, local_legacy_plan]}
+            "plan": {
+                "anyOf": [
+                    compute_plan,
+                    local_text_plan,
+                    local_json_plan,
+                    local_legacy_plan,
+                    compose_plan,
+                ]
+            }
         },
         "required": ["plan"],
     }
@@ -329,6 +414,89 @@ def _lower_answer_fields(fields: object, output_format: str) -> dict[str, Any]:
     }
 
 
+def _lower_output_descriptors(value: object) -> dict[str, str]:
+    if type(value) is not list or not 1 <= len(value) <= MAX_OUTPUTS:
+        raise _fail("PLAN_RESPONSE_INVALID")
+    outputs: dict[str, str] = {}
+    for item in value:
+        if not _is_wire_dict(item):
+            raise _fail("PLAN_RESPONSE_INVALID")
+        _expect_keys(item, {"key", "expression"}, code="PLAN_RESPONSE_INVALID")
+        key = _validate_name(item["key"], code="PLAN_OUTPUT_INVALID")
+        if key in outputs:
+            raise _fail("PLAN_OUTPUT_INVALID")
+        expression = _validate_text(
+            item["expression"], code="PLAN_EXPR_INVALID", maximum=MAX_EXPR_CHARS
+        )
+        outputs[key] = expression
+    return outputs
+
+
+def _validate_template_text(text: object, output_names: set[str]) -> str:
+    if type(text) is not str:
+        raise _fail("PLAN_TEMPLATE_INVALID")
+    if not text:
+        raise _fail("PLAN_TEMPLATE_INVALID")
+    try:
+        encoded_length = len(text.encode("utf-8"))
+    except UnicodeError:
+        raise _fail("PLAN_TEMPLATE_INVALID") from None
+    if encoded_length > MAX_TEMPLATE_BYTES:
+        raise _fail("PLAN_TEMPLATE_LIMIT")
+    slots = 0
+    position = 0
+    while position < len(text):
+        character = text[position]
+        if character == "{":
+            if not text.startswith("{{", position):
+                raise _fail("PLAN_TEMPLATE_INVALID")
+            end = text.find("}}", position + 2)
+            if end < 0:
+                raise _fail("PLAN_TEMPLATE_INVALID")
+            name = text[position + 2 : end]
+            if _SLOT_NAME.fullmatch(name) is None:
+                raise _fail("PLAN_TEMPLATE_INVALID")
+            if name not in output_names:
+                raise _fail("PLAN_TEMPLATE_INVALID")
+            slots += 1
+            if slots > MAX_TEMPLATE_SLOTS:
+                raise _fail("PLAN_TEMPLATE_LIMIT")
+            position = end + 2
+            continue
+        if character == "}":
+            raise _fail("PLAN_TEMPLATE_INVALID")
+        position += 1
+    return text
+
+
+def _validate_render(
+    raw: object, output_names: set[str], numeric_outputs: set[str]
+) -> ComposeRender:
+    if not _is_wire_dict(raw):
+        raise _fail("PLAN_TEMPLATE_INVALID")
+    kind = raw.get("kind")
+    if kind == "template":
+        _expect_keys(raw, {"kind", "text"}, code="PLAN_TEMPLATE_INVALID")
+        return TemplateRender("template", _validate_template_text(raw["text"], output_names))
+    if kind == "sign":
+        _expect_keys(
+            raw,
+            {"kind", "selector", "negative", "zero", "positive"},
+            code="PLAN_TEMPLATE_INVALID",
+        )
+        selector = _validate_name(raw["selector"], code="PLAN_TEMPLATE_INVALID")
+        if selector not in numeric_outputs:
+            raise _fail("PLAN_TEMPLATE_INVALID")
+        negative = _validate_template_text(raw["negative"], output_names)
+        zero = _validate_template_text(raw["zero"], output_names)
+        positive = _validate_template_text(raw["positive"], output_names)
+        total = sum(len(item.encode("utf-8")) for item in (negative, zero, positive))
+        if total > MAX_RENDER_BYTES:
+            raise _fail("PLAN_TEMPLATE_LIMIT")
+        return SignRender("sign", selector, negative, zero, positive)
+    raise _fail("PLAN_TEMPLATE_INVALID")
+
+
 def lower_planner_plan(raw: object) -> dict[str, Any]:
     if not _is_wire_dict(raw):
         raise _fail("PLAN_RESPONSE_INVALID")
@@ -342,22 +510,58 @@ def lower_planner_plan(raw: object) -> dict[str, Any]:
         raise _fail("PLAN_RESPONSE_INVALID")
     if kind == "compute":
         _expect_keys(plan, {"version", "kind", "inputs", "outputs"}, code="PLAN_RESPONSE_INVALID")
-        outputs_raw = plan["outputs"]
-        if type(outputs_raw) is not list or not 1 <= len(outputs_raw) <= MAX_OUTPUTS:
-            raise _fail("PLAN_RESPONSE_INVALID")
-        outputs: dict[str, str] = {}
-        for item in outputs_raw:
-            if not _is_wire_dict(item):
-                raise _fail("PLAN_RESPONSE_INVALID")
-            _expect_keys(item, {"key", "expression"}, code="PLAN_RESPONSE_INVALID")
-            key = _validate_name(item["key"], code="PLAN_OUTPUT_INVALID")
-            if key in outputs:
-                raise _fail("PLAN_OUTPUT_INVALID")
-            expression = _validate_text(
-                item["expression"], code="PLAN_EXPR_INVALID", maximum=MAX_EXPR_CHARS
-            )
-            outputs[key] = expression
+        outputs = _lower_output_descriptors(plan["outputs"])
         return {"version": 2, "kind": "compute", "inputs": plan["inputs"], "outputs": outputs}
+    if kind == "compose":
+        _expect_keys(
+            plan,
+            {"version", "kind", "inputs", "outputs", "render"},
+            code="PLAN_RESPONSE_INVALID",
+        )
+        outputs = _lower_output_descriptors(plan["outputs"])
+        names = set(outputs)
+        render = plan["render"]
+        if not _is_wire_dict(render):
+            raise _fail("PLAN_TEMPLATE_INVALID")
+        if render.get("kind") == "sign":
+            selector = _validate_name(render.get("selector"), code="PLAN_TEMPLATE_INVALID")
+            if selector not in names:
+                raise _fail("PLAN_TEMPLATE_INVALID")
+        normalized_render: dict[str, Any]
+        if render.get("kind") == "template":
+            _expect_keys(render, {"kind", "text"}, code="PLAN_TEMPLATE_INVALID")
+            normalized_render = {
+                "kind": "template",
+                "text": _validate_template_text(render["text"], names),
+            }
+        elif render.get("kind") == "sign":
+            _expect_keys(
+                render,
+                {"kind", "selector", "negative", "zero", "positive"},
+                code="PLAN_TEMPLATE_INVALID",
+            )
+            normalized_render = {
+                "kind": "sign",
+                "selector": _validate_name(render["selector"], code="PLAN_TEMPLATE_INVALID"),
+                "negative": _validate_template_text(render["negative"], names),
+                "zero": _validate_template_text(render["zero"], names),
+                "positive": _validate_template_text(render["positive"], names),
+            }
+            total = sum(
+                len(normalized_render[key].encode("utf-8"))
+                for key in ("negative", "zero", "positive")
+            )
+            if total > MAX_RENDER_BYTES:
+                raise _fail("PLAN_TEMPLATE_LIMIT")
+        else:
+            raise _fail("PLAN_TEMPLATE_INVALID")
+        return {
+            "version": 3,
+            "kind": "compose",
+            "inputs": plan["inputs"],
+            "outputs": outputs,
+            "render": normalized_render,
+        }
     if kind == "local_answer":
         if plan.get("answer_contract") == "unconstrained":
             _expect_keys(
@@ -764,6 +968,33 @@ def validate_local_answer_result(plan: LocalAnswerPlan, raw: object) -> str:
     return raw
 
 
+def _parse_compute_plan_fields(
+    raw: dict[str, Any], *, version: int
+) -> tuple[ComputePlan, dict[str, ExprType]]:
+    inputs = _parse_inputs(raw["inputs"])
+    outputs_raw = raw["outputs"]
+    if not _is_wire_dict(outputs_raw) or not outputs_raw or len(outputs_raw) > MAX_OUTPUTS:
+        raise _fail("PLAN_OUTPUT_INVALID")
+    input_types = {item.name: item.type for item in inputs}
+    state = {"nodes": 0}
+    outputs: dict[str, Expr] = {}
+    output_types: dict[str, ExprType] = {}
+    for key, raw_expr in outputs_raw.items():
+        output_key = _validate_name(key, code="PLAN_OUTPUT_INVALID")
+        if version == 2:
+            if type(raw_expr) is not str:
+                raise _fail("PLAN_EXPR_INVALID")
+            raw_expr = parse_expression(raw_expr, dict(input_types))
+        expression, expression_type = _parse_expr(
+            raw_expr, input_types, depth=1, state=state, active=set()
+        )
+        if expression_type not in {"number", "text"}:
+            raise _fail("PLAN_TYPE_INVALID")
+        outputs[output_key] = expression
+        output_types[output_key] = expression_type
+    return ComputePlan(1, "compute", inputs, outputs), output_types
+
+
 def validate_plan(raw: object) -> TypedPlan:
     if not _is_wire_dict(raw):
         raise _fail("PLAN_INVALID")
@@ -775,26 +1006,24 @@ def validate_plan(raw: object) -> TypedPlan:
         if version not in (1, 2):
             raise _fail("PLAN_INVALID")
         _expect_keys(raw, {"version", "kind", "inputs", "outputs"}, code="PLAN_INVALID")
-        inputs = _parse_inputs(raw["inputs"])
-        outputs_raw = raw["outputs"]
-        if not _is_wire_dict(outputs_raw) or not outputs_raw or len(outputs_raw) > MAX_OUTPUTS:
-            raise _fail("PLAN_OUTPUT_INVALID")
-        input_types = {item.name: item.type for item in inputs}
-        state = {"nodes": 0}
-        outputs: dict[str, Expr] = {}
-        for key, raw_expr in outputs_raw.items():
-            output_key = _validate_name(key, code="PLAN_OUTPUT_INVALID")
-            if version == 2:
-                if type(raw_expr) is not str:
-                    raise _fail("PLAN_EXPR_INVALID")
-                raw_expr = parse_expression(raw_expr, dict(input_types))
-            expression, expression_type = _parse_expr(
-                raw_expr, input_types, depth=1, state=state, active=set()
-            )
-            if expression_type not in {"number", "text"}:
-                raise _fail("PLAN_TYPE_INVALID")
-            outputs[output_key] = expression
-        return ComputePlan(1, "compute", inputs, outputs)
+        compute, _ = _parse_compute_plan_fields(raw, version=version)
+        return compute
+    if kind == "compose":
+        if version != 3:
+            raise _fail("PLAN_INVALID")
+        _expect_keys(
+            raw,
+            {"version", "kind", "inputs", "outputs", "render"},
+            code="PLAN_INVALID",
+        )
+        compute_candidate, output_types = _parse_compute_plan_fields(
+            {"inputs": raw["inputs"], "outputs": raw["outputs"]}, version=2
+        )
+        numeric_outputs = {
+            name for name, result_type in output_types.items() if result_type == "number"
+        }
+        render = _validate_render(raw["render"], set(compute_candidate.outputs), numeric_outputs)
+        return ComposePlan(3, "compose", compute_candidate, render)
     if kind == "local_answer":
         if version in (1, 2):
             _expect_keys(
@@ -1060,6 +1289,125 @@ def _check_typed_compute_boundary(plan: ComputePlan) -> None:
         raise _fail("PLAN_INVALID")
 
 
+def _check_typed_compose_boundary(plan: ComposePlan) -> None:
+    if type(plan) is not ComposePlan:
+        raise _fail("PLAN_INVALID")
+    if type(plan.version) is not int or plan.version != 3 or plan.kind != "compose":
+        raise _fail("PLAN_INVALID")
+    compute = plan.compute
+    _check_typed_compute_boundary(compute)
+    input_names: set[str] = set()
+    for item in compute.inputs:
+        if type(item) is not PlanInput or type(item.name) is not str:
+            raise _fail("PLAN_INVALID")
+        if item.name in input_names or item.type not in {"number", "numbers", "text"}:
+            raise _fail("PLAN_INVALID")
+        input_names.add(item.name)
+    numeric_outputs: set[str] = set()
+    for name, expression in compute.outputs.items():
+        if type(name) is not str or _validate_name(name, code="PLAN_INVALID") != name:
+            raise _fail("PLAN_INVALID")
+        if type(expression) is not Expr or expression.op not in _ALL_OPS:
+            raise _fail("PLAN_INVALID")
+        if expression.op == "text_ref":
+            result_type = "text"
+        elif expression.op == "const":
+            if type(expression.value) is not Decimal:
+                raise _fail("PLAN_INVALID")
+            _decimal_from_value(expression.value, code="PLAN_INVALID")
+            result_type = "number"
+        elif expression.op in {
+            "ref",
+            "sum",
+            "mean",
+            "min",
+            "max",
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "round",
+            "dot",
+        }:
+            result_type = "number"
+        else:
+            raise _fail("PLAN_INVALID")
+        if result_type == "number":
+            numeric_outputs.add(name)
+    render = plan.render
+    if type(render) is TemplateRender and render.kind == "template":
+        _validate_template_text(render.text, set(compute.outputs))
+        return
+    if type(render) is SignRender and render.kind == "sign":
+        if render.selector not in numeric_outputs:
+            raise _fail("PLAN_TEMPLATE_INVALID")
+        for text in (render.negative, render.zero, render.positive):
+            _validate_template_text(text, set(compute.outputs))
+        total = sum(
+            len(text.encode("utf-8")) for text in (render.negative, render.zero, render.positive)
+        )
+        if total > MAX_RENDER_BYTES:
+            raise _fail("PLAN_TEMPLATE_LIMIT")
+        return
+    raise _fail("PLAN_TEMPLATE_INVALID")
+
+
+def _decimal_result_text(value: Decimal) -> str:
+    value = _bounded_result(value)
+    if value == 0:
+        return "0"
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _compose_scalar_text(value: Decimal | str) -> str:
+    if type(value) is str:
+        try:
+            value.encode("utf-8")
+        except UnicodeError:
+            raise _fail("PLAN_RESULT_INVALID") from None
+        return value
+    if type(value) is not Decimal:
+        raise _fail("PLAN_RESULT_INVALID")
+    return _decimal_result_text(value)
+
+
+def _render_compose_template(text: str, values: Mapping[str, Decimal | str]) -> str:
+    pieces: list[str] = []
+    used_bytes = 0
+
+    def append(piece: str) -> None:
+        nonlocal used_bytes
+        try:
+            used_bytes += len(piece.encode("utf-8"))
+        except UnicodeError:
+            raise _fail("PLAN_RESULT_INVALID") from None
+        if used_bytes > MAX_OUTPUT_BYTES:
+            raise _fail("PLAN_RESULT_LIMIT")
+        pieces.append(piece)
+
+    position = 0
+    while position < len(text):
+        if text.startswith("{{", position):
+            end = text.find("}}", position + 2)
+            if end < 0:
+                raise _fail("PLAN_TEMPLATE_INVALID")
+            name = text[position + 2 : end]
+            if name not in values:
+                raise _fail("PLAN_TEMPLATE_INVALID")
+            append(_compose_scalar_text(values[name]))
+            position = end + 2
+            continue
+        next_slot = text.find("{{", position)
+        if next_slot < 0:
+            next_slot = len(text)
+        append(text[position:next_slot])
+        position = next_slot
+    return "".join(pieces)
+
+
 def execute_compute_plan(
     plan: ComputePlan | object, local_inputs: dict[str, object]
 ) -> dict[str, Decimal | str]:
@@ -1089,6 +1437,29 @@ def execute_compute_plan(
     return checked
 
 
+def execute_compose_plan(plan: ComposePlan | object, local_inputs: dict[str, object]) -> str:
+    if isinstance(plan, (ComputePlan, LocalAnswerPlan)):
+        raise _fail("LOCAL_ADAPTER_REQUIRED")
+    candidate = validate_plan(plan) if not isinstance(plan, ComposePlan) else plan
+    if type(candidate) is not ComposePlan:
+        raise _fail("LOCAL_ADAPTER_REQUIRED")
+    _check_typed_compose_boundary(candidate)
+    result = execute_compute_plan(candidate.compute, local_inputs)
+    render = candidate.render
+    if type(render) is TemplateRender:
+        return _render_compose_template(render.text, result)
+    selector_value = result.get(render.selector) if type(render) is SignRender else None
+    if type(render) is not SignRender or type(selector_value) is not Decimal:
+        raise _fail("PLAN_TEMPLATE_INVALID")
+    if selector_value < 0:
+        selected = render.negative
+    elif selector_value > 0:
+        selected = render.positive
+    else:
+        selected = render.zero
+    return _render_compose_template(selected, result)
+
+
 def serialize_result(result: Mapping[str, Decimal | str]) -> str:
     if type(result) is not dict or not result:
         raise _fail("PLAN_RESULT_INVALID")
@@ -1105,13 +1476,7 @@ def serialize_result(result: Mapping[str, Decimal | str]) -> str:
             continue
         if type(value) is not Decimal:
             raise _fail("PLAN_RESULT_INVALID")
-        value = _bounded_result(value)
-        if value == 0:
-            text = "0"
-        else:
-            text = format(value, "f")
-            if "." in text:
-                text = text.rstrip("0").rstrip(".")
+        text = _decimal_result_text(value)
         pieces.append(f"{json.dumps(key, ensure_ascii=False, separators=(',', ':'))}:{text}")
     encoded = "{" + ",".join(pieces) + "}"
     if len(encoded.encode("utf-8")) > MAX_OUTPUT_BYTES:
@@ -1120,11 +1485,16 @@ def serialize_result(result: Mapping[str, Decimal | str]) -> str:
 
 
 __all__ = [
+    "ComposePlan",
+    "ComposeRender",
     "ComputePlan",
     "Expr",
     "LocalAnswerPlan",
     "PlanInput",
+    "SignRender",
+    "TemplateRender",
     "TypedPlan",
+    "execute_compose_plan",
     "execute_compute_plan",
     "lower_planner_plan",
     "planner_output_schema",

@@ -6,8 +6,11 @@ from collections.abc import AsyncGenerator, Mapping
 
 import httpx
 
+from privacy_gateway.adapters.local_context import check_local_context
 from privacy_gateway.adapters.local_detector import ENDPOINT
 from privacy_gateway.adapters.model_profiles import model_profile
+from privacy_gateway.adapters.provider import ProviderNotDispatched
+from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES, MAX_REQUEST_BYTES
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.serialization import strict_json
 from privacy_gateway.domain.streaming import SSEDecoder
@@ -77,6 +80,8 @@ class LocalChatProvider:
     async def stream(self, body: bytes) -> AsyncGenerator[str, None]:
         if not self.key:
             raise PrivacyError("LOCAL_CHAT_UNAVAILABLE")
+        if len(body) > MAX_REQUEST_BYTES:
+            raise PrivacyError("INVALID_PAYLOAD")
         try:
             payload = strict_json(body)
             if (
@@ -88,7 +93,7 @@ class LocalChatProvider:
                     for k, v in self.request_options.items()
                 )
                 or not isinstance(payload["messages"], list)
-                or not 1 <= len(payload["messages"]) <= 40
+                or not 1 <= len(payload["messages"]) <= MAX_HISTORY_MESSAGES
                 or any(
                     not isinstance(m, dict)
                     or set(m) != {"role", "content"}
@@ -98,8 +103,6 @@ class LocalChatProvider:
                 )
             ):
                 raise PrivacyError("INVALID_PAYLOAD")
-            if sum(len(m["content"].encode("utf-8")) for m in payload["messages"]) > 6000:
-                raise PrivacyError("LOCAL_CHAT_CONTEXT_LIMIT")
         except (ValueError, TypeError, KeyError) as error:
             if isinstance(error, PrivacyError):
                 raise
@@ -115,12 +118,19 @@ class LocalChatProvider:
                 async with (
                     asyncio.timeout(self.timeout),
                     httpx.AsyncClient(
+                        base_url=ENDPOINT,
                         trust_env=False,
                         follow_redirects=False,
                         timeout=self.timeout,
                         headers={"Authorization": f"Bearer {self.key}"},
                     ) as client,
                 ):
+                    try:
+                        await check_local_context(
+                            client, body, limit_code="LOCAL_CHAT_CONTEXT_LIMIT"
+                        )
+                    except PrivacyError as error:
+                        raise ProviderNotDispatched(str(error)) from None
                     async with client.stream(
                         "POST",
                         ENDPOINT + "/v1/chat/completions",

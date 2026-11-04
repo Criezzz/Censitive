@@ -60,7 +60,11 @@ export function ProvidersDialog(props: ProviderDialogProps) {
               onClick={() => selectChoice(p.id)}
             >
               <span className="provider-symbol">
-                {p.id === "local-demo" ? "◇" : "⌘"}
+                {p.id === "local-demo"
+                  ? "◇"
+                  : p.id === "antigravity-google"
+                    ? "✦"
+                    : "⌘"}
               </span>
               <span>
                 <strong>{p.name}</strong>
@@ -71,7 +75,9 @@ export function ProvidersDialog(props: ProviderDialogProps) {
                       ? "Mô hình chạy trên máy"
                       : p.id === "openai-api"
                         ? "API key · cloud"
-                        : "Tài khoản ChatGPT · cloud"}
+                        : p.id === "antigravity-google"
+                          ? "Tài khoản Google · CLI"
+                          : "Tài khoản ChatGPT · cloud"}
                 </small>
               </span>
               {current === p.id && (
@@ -111,6 +117,12 @@ export function ProvidersDialog(props: ProviderDialogProps) {
                   và chi phí do tài khoản OpenAI API của bạn quyết định.
                 </p>
               </>
+            ) : chosen.id === "antigravity-google" ? (
+              <AntigravityConnectionCard
+                chosen={chosen}
+                working={working}
+                onCheck={() => void action("/providers/antigravity/check")}
+              />
             ) : (
               <>
                 <label htmlFor="auth-method">Cách kết nối</label>
@@ -212,7 +224,9 @@ export function ProvidersDialog(props: ProviderDialogProps) {
                   ? "Model được cấu hình ở backend; chưa kiểm chứng bằng API thật"
                   : chosen.id === "codex-chatgpt"
                     ? "Model từng được kiểm chứng cho tích hợp; vẫn cần kiểm tra kết nối hiện tại"
-                    : "Model đã được kiểm chứng cho tích hợp hiện tại"}
+                    : chosen.id === "antigravity-google"
+                      ? "Model do backend khai báo; chat đang bị khóa vì chưa kiểm chứng cách ly context/tools"
+                      : "Model đã được kiểm chứng cho tích hợp hiện tại"}
             </small>
           </section>
         )}
@@ -236,5 +250,69 @@ export function ProvidersDialog(props: ProviderDialogProps) {
         </button>
       </div>
     </dialog>
+  );
+}
+
+function AntigravityConnectionCard({
+  chosen,
+  working,
+  onCheck,
+}: {
+  chosen: NonNullable<ReturnType<typeof useProviderConnections>["chosen"]>;
+  working: boolean;
+  onCheck: () => void;
+}) {
+  const codeMessage =
+    chosen.code === "CONNECTION_FAILED"
+      ? "Không thể kiểm tra kết nối Antigravity trên máy."
+      : (connectionMessages[chosen.code] ?? "");
+  const statusText = working
+    ? "Đang kiểm tra thông tin kết nối…"
+    : chosen.status === "unchecked"
+      ? "Chưa kiểm tra kết nối trên máy."
+      : chosen.authenticated === true
+        ? "Đã xác thực tài khoản Google. Chưa đủ điều kiện gửi chat: chưa kiểm chứng cách ly context/tools."
+        : codeMessage
+          ? codeMessage
+          : chosen.authenticated === false
+            ? "Chưa xác nhận phiên đăng nhập Google."
+            : "Kết nối Antigravity hiện chưa sẵn sàng.";
+  const quota = chosen.quota;
+  const quotaEntries = Array.isArray(quota)
+    ? quota.map((bucket) => ({
+        label: `${bucket.group} · ${bucket.window}`,
+        value: `≈ ${(bucket.remaining_fraction * 100).toFixed(3)}% còn lại · đặt lại ${bucket.reset_time}`,
+      }))
+    : [];
+
+  return (
+    <>
+      <p>
+        Antigravity dùng tài khoản Google qua CLI chính thức. Kiểm tra dưới đây
+        chỉ đọc metadata kết nối; không gửi nội dung hội thoại và không đăng
+        nhập thay bạn.
+      </p>
+      <div className="connection-status unavailable" role="status">
+        {statusText}
+      </div>
+      <p className="connection-boundary-warning">
+        Chưa đủ điều kiện gửi chat: chưa kiểm chứng cách ly context/tools.
+      </p>
+      {quotaEntries.length > 0 && (
+        <dl className="connection-metadata" aria-label="Metadata Antigravity">
+          {quotaEntries.map(({ label, value }) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd>{String(value)}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      <div className="connection-actions">
+        <button className="secondary" disabled={working} onClick={onCheck}>
+          Kiểm tra kết nối
+        </button>
+      </div>
+    </>
   );
 }

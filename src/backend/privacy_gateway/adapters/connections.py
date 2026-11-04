@@ -4,11 +4,14 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from privacy_gateway.adapters.antigravity_connection import AntigravityConnection
 from privacy_gateway.adapters.codex_provider import CodexProvider
 from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_chat import LocalChatProvider
 from privacy_gateway.adapters.openai_provider import OpenAIProvider
 from privacy_gateway.adapters.provider import Provider
+from privacy_gateway.application.private_work import PrivateWorkbench, PrivateWorker
+from privacy_gateway.domain.private_plan import planner_output_schema
 from privacy_gateway.domain.redaction import PrivacyError
 
 PUBLIC_CODES = {
@@ -29,6 +32,7 @@ class ProviderConnections:
         *,
         local: LocalChatProvider | None = None,
         openai: OpenAIProvider | None = None,
+        antigravity: AntigravityConnection | None = None,
     ) -> None:
         self.demo: Provider = default if default.provider_id == "local-demo" else FakeProvider()
         self.codex = default if isinstance(default, CodexProvider) else None
@@ -40,6 +44,7 @@ class ProviderConnections:
         self.login_owner = ""
         self.local = local
         self.openai = default if isinstance(default, OpenAIProvider) else openai
+        self.antigravity = antigravity or AntigravityConnection()
 
     def catalog(self) -> list[dict[str, object]]:
         catalog: list[dict[str, object]] = [
@@ -72,6 +77,7 @@ class ProviderConnections:
                     "streaming": True,
                 }
             )
+        catalog.append(self.antigravity.catalog())
         code = self.openai.configuration_error() if self.openai else "OPENAI_API_KEY_REQUIRED"
         catalog.append(
             {
@@ -113,6 +119,9 @@ class ProviderConnections:
             else:
                 self.status, self.code = "ready", ""
 
+    async def check_antigravity(self) -> None:
+        await self.antigravity.check()
+
     async def resolve(self, provider_id: str, model: str) -> Provider:
         if provider_id == "openai-api":
             if self.openai is None:
@@ -133,12 +142,33 @@ class ProviderConnections:
             return self.local
         if provider_id == "local-demo" and model == self.demo.model:
             return self.demo
+        if provider_id == self.antigravity.provider_id:
+            raise PrivacyError("ANTIGRAVITY_BOUNDARY_UNVERIFIED")
         if provider_id != "codex-chatgpt" or model != CodexProvider.model:
             raise PrivacyError("UNKNOWN_PROVIDER_MODEL")
         await self.check()
         if self.status != "ready" or self.codex is None:
             raise PrivacyError(self.code or "LOGIN_BUSY")
         return self.codex
+
+    def private_work_available(self, provider: Provider) -> bool:
+        return isinstance(provider, CodexProvider) and provider.model == CodexProvider.model
+
+    async def private_work(
+        self, provider: Provider, worker: PrivateWorker | None
+    ) -> PrivateWorkbench:
+        if worker is None or not self.private_work_available(provider):
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        assert isinstance(provider, CodexProvider)
+        try:
+            planner = await asyncio.to_thread(
+                CodexProvider, provider.executable, output_schema=planner_output_schema()
+            )
+        except PrivacyError:
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError, StopIteration):
+            raise PrivacyError("CONNECTION_FAILED") from None
+        return PrivateWorkbench(planner, worker)
 
     async def start_login(self, owner: str) -> None:
         await self.check()

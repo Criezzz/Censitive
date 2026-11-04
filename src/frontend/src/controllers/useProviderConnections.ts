@@ -24,12 +24,14 @@ export function useProviderConnections({
   const [error, setError] = useState("");
   const chosen = providers.find((p) => p.id === selected);
   const canSelect =
-    chosen?.status === "ready" ||
-    (chosen?.id === "openai-api" && chosen.status === "configured");
+    chosen?.id !== "antigravity-google" &&
+    (chosen?.status === "ready" ||
+      (chosen?.id === "openai-api" && chosen.status === "configured"));
   const signingIn = providers.some((p) => p.status === "signing_in");
 
   useEffect(() => {
     const element = dialog.current!;
+    const opener = document.activeElement;
     element.showModal();
     let active = true;
     request<Catalog>("/providers")
@@ -42,6 +44,7 @@ export function useProviderConnections({
     return () => {
       active = false;
       element.close();
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
     };
   }, [request]);
 

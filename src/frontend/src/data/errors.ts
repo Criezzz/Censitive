@@ -1,4 +1,28 @@
 export const errors: Record<string, string> = {
+  LEDGER_FORM_INVALID:
+    "Mỗi khoản nhập tay cần một dòng Nhãn: số, ví dụ Hoa: 14.5.",
+  LEDGER_NUMBER_INVALID:
+    "Giá trị số chưa hợp lệ. Hãy kiểm tra số, dấu và đơn vị trong biểu mẫu.",
+  LEDGER_PERCENT_INVALID:
+    "Phụ phí chưa hợp lệ. Nhập tỷ lệ phần trăm rõ ràng, ví dụ 7 hoặc 7%.",
+  JEV_KEY_REQUIRED: "Cần API key TypeSafe để bật Jev. Chưa gửi Jev.",
+  JEV_KEY_INVALID: "API key Jev không hợp lệ về định dạng.",
+  JEV_PLAN_UNSUPPORTED:
+    "Jev hiện chỉ kiểm plan compute/compose. Plan này chưa được thực thi local.",
+  JEV_REJECTED:
+    "Jev phát hiện vấn đề trong kế hoạch; local worker chưa chạy. Xem quyết định bên dưới.",
+  JEV_REVIEW_REQUIRED:
+    "Jev chưa đủ chắc chắn; local worker chưa chạy. Xem quyết định bên dưới.",
+  JEV_HTTP_ERROR:
+    "TypeSafe từ chối yêu cầu. Kiểm tra key/quota; không tự thử lại hoặc tắt gate.",
+  JEV_TIMEOUT:
+    "Jev hết thời gian chờ. Request có thể đã tới TypeSafe; không tự gửi lại.",
+  JEV_CONNECTION_FAILED:
+    "Không nhận được kết quả Jev. Request có thể đã gửi; không tự thử lại.",
+  JEV_RESPONSE_INVALID:
+    "Phản hồi Jev không đúng contract; local worker chưa chạy.",
+  JEV_PAYLOAD_INVALID: "Không thể tạo payload Jev hợp lệ; chưa gửi Jev.",
+  JEV_PAYLOAD_LIMIT: "Payload Jev vượt giới hạn; chưa gửi Jev.",
   OPENAI_API_KEY_REQUIRED:
     "Backend chưa có API key OpenAI. Cấu hình key trên máy rồi kiểm tra kết nối; không nhập key vào hội thoại.",
   OPENAI_API_KEY_INVALID:
@@ -50,7 +74,11 @@ export const errors: Record<string, string> = {
   SEMANTIC_TIMEOUT:
     "Phân tích local hết thời gian chờ. Hãy rút ngắn nội dung rồi thử lại.",
   SEMANTIC_CONTEXT_LIMIT:
-    "Ngữ cảnh vượt 6.000 ký tự cho bộ phân tích local. Hãy tạo phiên mới hoặc rút ngắn nội dung; ứng dụng không tự cắt lịch sử.",
+    "Ngữ cảnh vượt giới hạn xử lý local. Hãy tạo phiên mới hoặc rút ngắn nội dung; ứng dụng không tự cắt lịch sử.",
+  LOCAL_CHAT_CONTEXT_LIMIT:
+    "Ngữ cảnh không còn đủ chỗ cho phản hồi của model local. Hãy rút ngắn nội dung hoặc mở hội thoại mới.",
+  LOCAL_CONTEXT_UNAVAILABLE:
+    "Không thể kiểm tra dung lượng ngữ cảnh local nên chưa hoàn tất xử lý. Hãy khởi động lại runtime đúng phiên bản.",
   SEMANTIC_BUSY:
     "Model local đang hoàn tất một lượt phân tích. Chờ một lúc rồi chuẩn bị lại.",
   SEMANTIC_INVALID_OUTPUT:
@@ -67,7 +95,10 @@ export const errors: Record<string, string> = {
     "Bản xem trước đã hết hạn hoặc thay đổi. Hãy chuẩn bị lại trước khi gửi.",
   CANCELLED: "Đã hủy. Phản hồi này không được thêm vào lịch sử.",
   SESSION_BUSY: "Phiên đang xử lý. Hãy chờ hoặc hủy lượt hiện tại.",
-  HISTORY_LIMIT: "Phiên đã đạt giới hạn demo. Hãy tạo phiên mới để tiếp tục.",
+  HISTORY_LIMIT:
+    "Hội thoại đạt giới hạn lưu trữ của ứng dụng. Lịch sử vẫn còn; hãy mở hội thoại mới để tiếp tục.",
+  CONTEXT_LIMIT:
+    "Bản gửi đầy đủ vượt giới hạn kích thước của ứng dụng. Chưa gửi hoặc cắt lịch sử; hãy rút ngắn nội dung mới hoặc mở hội thoại khác.",
   DETECTION_LIMIT:
     "Nội dung có quá nhiều vùng cần che. Hãy chia thành yêu cầu ngắn hơn.",
   VAULT_LIMIT: "Phiên đã đạt giới hạn giá trị bảo vệ. Hãy tạo phiên mới.",
@@ -84,6 +115,12 @@ export const errors: Record<string, string> = {
   MALFORMED_TOKEN:
     "Token trong phản hồi không hợp lệ. Không phục hồi hoặc lưu phản hồi.",
   AUTH_REQUIRED: "Phiên kết nối đã hết hiệu lực. Hãy tải lại trang.",
+  PROVIDER_UNAVAILABLE:
+    "Provider của phiên chưa sẵn sàng. Hãy chọn lại provider trước khi chuẩn bị.",
+  SEND_OUTCOME_UNKNOWN:
+    "Kết quả lượt trước chưa rõ. Hãy kiểm tra lịch sử và tạo phiên mới; không tự gửi lại.",
+  PROCESSING_MODE_UNAVAILABLE:
+    "Chế độ xử lý của phiên hiện không khả dụng. Hãy tạo phiên mới để tiếp tục.",
   SESSION_NOT_FOUND:
     "Phiên không còn tồn tại. Hãy tải lại trang hoặc tạo phiên mới.",
   PROVIDER_FAILED:
@@ -95,6 +132,36 @@ export const errors: Record<string, string> = {
     "Hãy đăng nhập Codex bằng ChatGPT rồi chuẩn bị lại lượt này.",
   CODEX_UNEXPECTED_TOOL:
     "Codex trả về thao tác công cụ ngoài phạm vi chat. Lượt này đã bị chặn.",
+  PRIVATE_WORK_UNAVAILABLE:
+    "Private work chưa khả dụng: cần local worker và provider planner đã được cấu hình.",
+  PRIVATE_WORK_BUSY:
+    "Private work của phiên đang bận. Hãy chờ trạng thái hiện tại được xác nhận.",
+  PRIVATE_WORK_LIMIT:
+    "Phiên đã có quá nhiều private work đang chờ. Hãy bỏ bản xem trước cũ trước khi chuẩn bị tiếp.",
+  PRIVATE_WORK_HISTORY_LIMIT:
+    "Lịch sử private work của phiên đã đạt giới hạn. Hãy tạo phiên mới để tiếp tục.",
+  PRIVATE_WORK_STORAGE_LIMIT:
+    "Bộ nhớ lịch sử private work đã đạt giới hạn. Hãy tạo phiên mới để tiếp tục.",
+  PRIVATE_WORK_NOT_FOUND:
+    "Bản private work không còn tồn tại hoặc đã được xử lý. Hãy kiểm tra lịch sử phiên.",
+  PRIVATE_WORK_APPROVAL_MISMATCH:
+    "Bản gửi private work đã thay đổi hoặc hết hạn. Chưa gửi; hãy chuẩn bị lại.",
+  PRIVATE_WORK_FAILED:
+    "Local worker chưa hoàn tất private work. Kết quả chưa được xác nhận; hãy kiểm tra lịch sử.",
+  PRIVATE_WORK_OUTCOME_UNKNOWN:
+    "Chưa xác nhận được kết quả private work. Hãy kiểm tra lịch sử hoặc tạo phiên mới; không tự gửi lại.",
+  PRIVATE_PLANNER_TIMEOUT:
+    "Planner hết thời gian chờ. Kết quả chưa được xác nhận; hãy kiểm tra lịch sử trước khi tiếp tục.",
+  PUBLIC_TASK_INVALID:
+    "Yêu cầu công khai không hợp lệ hoặc quá dài. Hãy kiểm tra lại ô gửi tới planner.",
+  PRIVATE_TASK_INVALID:
+    "Yêu cầu công khai không hợp lệ. Hãy kiểm tra lại nội dung task.",
+  PRIVATE_CONTEXT_LIMIT:
+    "Dữ liệu riêng vượt giới hạn local. Hãy rút ngắn dữ liệu rồi chuẩn bị lại.",
+  PRIVATE_CONTEXT_INVALID:
+    "Dữ liệu riêng không hợp lệ. Hãy kiểm tra lại nội dung local trước khi chuẩn bị.",
+  PLANNER_SCHEMA_MISMATCH:
+    "Cấu hình planner không khớp schema private work. Hãy kiểm tra provider/model rồi chuẩn bị lại.",
 };
 
 export const correctionErrors = new Set([

@@ -5,6 +5,10 @@ from typing import Protocol, runtime_checkable
 from privacy_gateway.domain.redaction import PrivacyError
 
 
+class ProviderNotDispatched(PrivacyError):
+    pass
+
+
 class Provider(Protocol):
     provider_id: str
     model: str

@@ -12,6 +12,7 @@ from privacy_gateway.adapters.conversation_store import (
 )
 from privacy_gateway.adapters.local_chat import LocalChatProvider
 from privacy_gateway.adapters.local_detector import LocalDetector
+from privacy_gateway.adapters.local_private_worker import LocalPrivateWorker
 from privacy_gateway.adapters.openai_provider import OpenAIProvider
 from privacy_gateway.adapters.state_resolver import LocalStateResolver
 from privacy_gateway.api.app import create_app
@@ -63,6 +64,9 @@ def main() -> None:
             gateway.resolver = LocalStateResolver(args.local_model, lock=runtime_lock)
         else:
             gateway.detector = LocalDetector(args.local_model, lock=runtime_lock)
+        worker = LocalPrivateWorker(args.local_model, lock=runtime_lock)
+        if worker.key:
+            gateway.private_worker = worker
     store = None
     try:
         if args.storage_dir is not None:

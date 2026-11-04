@@ -5,6 +5,7 @@ from collections.abc import Mapping
 
 import httpx
 
+from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES, MAX_REQUEST_BYTES
 from privacy_gateway.domain.redaction import PrivacyError
 from privacy_gateway.domain.serialization import strict_json
 
@@ -49,7 +50,7 @@ class OpenAIProvider:
         return {"store": False, "max_completion_tokens": 512}
 
     def validate_body(self, body: bytes) -> None:
-        if len(body) > 200_000:
+        if len(body) > MAX_REQUEST_BYTES:
             raise PrivacyError("INVALID_PAYLOAD")
         payload = strict_json(body)
         if (
@@ -60,7 +61,7 @@ class OpenAIProvider:
             or type(payload.get("max_completion_tokens")) is not int
             or payload["max_completion_tokens"] != 512
             or not isinstance(payload["messages"], list)
-            or not 1 <= len(payload["messages"]) <= 40
+            or not 1 <= len(payload["messages"]) <= MAX_HISTORY_MESSAGES
             or any(
                 not isinstance(message, dict)
                 or set(message) != {"role", "content"}

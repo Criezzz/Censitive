@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from privacy_gateway.domain.jev import JevAssessment
 from privacy_gateway.domain.models import SourceSpan
+from privacy_gateway.domain.private_ledger import (
+    LedgerRevision,
+    PrivateLedger,
+    append_revision,
+)
 from privacy_gateway.domain.redaction import Binding, PrivacyError
 from privacy_gateway.domain.serialization import strict_json
 from privacy_gateway.domain.state import Entity, Fact, Link, Source, State
 
 if TYPE_CHECKING:
-    from privacy_gateway.application.gateway import CommandReceipt, Message, Session
+    from privacy_gateway.application.gateway import CommandReceipt, Message, PrivateWork, Session
 
 
 RECORD_VERSION = 1
@@ -189,7 +196,7 @@ class MessageRecord(_StrictModel):
 
 
 class BindingRecord(_StrictModel):
-    token: str = Field(pattern=r"\[\[PG_v1_[0-9a-f]{32}\]\]")
+    token: str = Field(pattern=r"^\[\[PG_v1_[0-9a-f]{32}\]\]$")
     value: str = Field(max_length=20_000)
     restore_allowed: bool = True
     scope: str = Field(default="", max_length=128)
@@ -258,17 +265,91 @@ class ProviderRecord(_StrictModel):
 class SendMarkerRecord(_StrictModel):
     marker_id: str = Field(min_length=1, max_length=128)
     prepared_id: str = Field(min_length=1, max_length=128)
-    request_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     provider_id: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=256)
     serializer_version: str = Field(min_length=1, max_length=128)
     original: str = Field(default="", max_length=20_000)
+    kind: Literal["provider", "private_work"] = "provider"
+    public_task: str = Field(default="", max_length=3_000)
+    private_context: str = Field(default="", max_length=12_000)
     status: Literal["may_have_been_sent"] = "may_have_been_sent"
+
+
+class PrivateWorkRecord(_StrictModel):
+    id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    public_task: str = Field(min_length=1, max_length=3_000)
+    private_context: str = Field(max_length=12_000)
+    answer: str = Field(max_length=200_000)
+    route: Literal["compute", "compose", "local_answer"]
+    public_body_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider: str = Field(min_length=1, max_length=128)
+    model: str = Field(min_length=1, max_length=256)
+    trace: list[str] = Field(default_factory=list, max_length=32)
+    plan: dict[str, object] | None = None
+    ledger_revision: int | None = Field(default=None, ge=1, le=32)
+    jev: JevAssessment | None = None
+
+    @field_validator("plan")
+    @classmethod
+    def bounded_plan(cls, value: dict[str, object] | None) -> dict[str, object] | None:
+        if value is None:
+            return None
+        try:
+            if (
+                len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                > 16_000
+            ):
+                raise ValueError("plan too large")
+        except (TypeError, ValueError, UnicodeError):
+            raise ValueError("invalid plan") from None
+        return value
+
+    @model_validator(mode="after")
+    def ledger_plan_pair(self) -> PrivateWorkRecord:
+        if (self.ledger_revision is None) != (self.plan is None):
+            raise ValueError("ledger plan pairing")
+        return self
+
+    @classmethod
+    def from_domain(cls, value: PrivateWork) -> PrivateWorkRecord:
+        return cls(
+            id=value.id,
+            public_task=value.public_task,
+            private_context=value.private_context,
+            answer=value.answer,
+            route=cast(Literal["compute", "compose", "local_answer"], value.route),
+            public_body_sha256=value.public_body_sha256,
+            provider=value.provider,
+            model=value.model,
+            trace=list(value.trace),
+            plan=value.plan,
+            ledger_revision=value.ledger_revision,
+            jev=value.jev,
+        )
+
+    def to_domain(self) -> PrivateWork:
+        from privacy_gateway.application.gateway import PrivateWork
+
+        return PrivateWork(
+            id=self.id,
+            public_task=self.public_task,
+            private_context=self.private_context,
+            answer=self.answer,
+            route=self.route,
+            public_body_sha256=self.public_body_sha256,
+            provider=self.provider,
+            model=self.model,
+            trace=tuple(self.trace),
+            plan=self.plan,
+            ledger_revision=self.ledger_revision,
+            jev=self.jev,
+        )
 
 
 class SessionRecord(_StrictModel):
     schema_version: Literal[1] = 1
-    id: str = Field(pattern=r"[0-9a-f]{32}")
+    id: str = Field(pattern=r"^[0-9a-f]{32}$")
     owner: str = Field(min_length=1, max_length=256)
     title: str = Field(default="", max_length=120)
     version: int = Field(default=0, ge=0)
@@ -278,6 +359,20 @@ class SessionRecord(_StrictModel):
     processing_mode: ProcessingMode = "rules"
     private_history: list[MessageRecord] = Field(default_factory=list)
     provider_history: list[MessageRecord] = Field(default_factory=list)
+    private_work_history: list[PrivateWorkRecord] = Field(default_factory=list, max_length=100)
+    private_ledger_history: list[LedgerRevision] = Field(default_factory=list, max_length=32)
+
+    @field_validator("private_ledger_history")
+    @classmethod
+    def valid_ledger_chain(cls, value: list[LedgerRevision]) -> list[LedgerRevision]:
+        try:
+            ledger: PrivateLedger | None = None
+            for revision in value:
+                ledger = append_revision(ledger, revision)
+        except (PrivacyError, ValidationError, TypeError, ValueError):
+            raise ValueError("invalid ledger chain") from None
+        return value
+
     vault: list[BindingRecord] = Field(default_factory=list)
     state: StateRecord = Field(default_factory=StateRecord)
     commands: dict[str, CommandRecord] = Field(default_factory=dict)
@@ -399,6 +494,10 @@ def session_record(
         processing_mode=cast(ProcessingMode, session.processing_mode),
         private_history=[MessageRecord.from_domain(item) for item in session.private_history],
         provider_history=[MessageRecord.from_domain(item) for item in session.provider_history],
+        private_work_history=[
+            PrivateWorkRecord.from_domain(item) for item in session.private_work_history
+        ],
+        private_ledger_history=list(session.private_ledger_history),
         vault=[BindingRecord.from_domain(item) for item in session.vault.values()],
         state=StateRecord.from_domain(session.state),
         commands={key: CommandRecord.from_domain(item) for key, item in session.commands.items()},
@@ -430,6 +529,7 @@ __all__ = [
     "MessageRecord",
     "ProcessingMode",
     "ProviderRecord",
+    "PrivateWorkRecord",
     "RecoveryInfo",
     "RecoveryStatus",
     "RECORD_VERSION",

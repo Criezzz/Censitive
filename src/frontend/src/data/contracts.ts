@@ -108,6 +108,16 @@ export type Preview = {
   body: string;
   expires_in: number;
   history_count: number;
+  context?: {
+    mode: "full_history";
+    message_count: number;
+    omitted_messages: number;
+    body_bytes: number;
+    body_limit_bytes: number;
+    archive_messages: number;
+    archive_limit_messages: number;
+    input_tokens: number | null;
+  };
   semantic: null | {
     model: string;
     elapsed_ms: number;
@@ -158,20 +168,147 @@ export type PreviewDecisionResult = {
 };
 export type SessionView = {
   id: string;
+  title?: string;
   provider: string;
   model: string;
+  provider_confirmed?: boolean;
+  recovery_status?: string | null;
+  interrupted_turn?: { text: string; status: string } | null;
+  interrupted_private_work?: InterruptedPrivateWork | null;
+  terms?: string[];
   messages: ChatMessage[];
   audit: { event: string; status: string; version: number }[];
   state?: FactState;
+  private_work_available?: boolean;
+  latest_jev?: JevAssessment | null;
+  private_work_history?: PrivateWorkRecord[];
+  private_ledger_available?: boolean;
+  private_ledger_model_available?: boolean;
+  private_ledger_history?: LedgerRevision[];
+};
+export type InterruptedPrivateWork = {
+  id: string;
+  public_task: string;
+  private_context: string;
+  status: "unknown";
 };
 export type Phase = "loading" | "idle" | "preparing" | "ready" | "sending";
+export type PrivateWorkPhase = "idle" | "preparing" | "ready" | "sending";
+export type JevAssessment = {
+  decision: "pass" | "review" | "reject";
+  model: string;
+  request_sha256: string;
+  input_tokens: number;
+  output_tokens: number;
+  latency_ms: number;
+  estimated_usd: string;
+};
+export type PrivateWorkRecord = {
+  id: string;
+  public_task: string;
+  private_context: string;
+  answer: string;
+  route: string;
+  public_body_sha256: string;
+  provider: string;
+  model: string;
+  trace: string[];
+  ledger_revision?: number | null;
+  jev?: JevAssessment | null;
+};
+export type PrivateWorkPreview = {
+  prepared_id: string;
+  public_task: string;
+  public_body: string;
+  public_body_sha256: string;
+  provider: string;
+  model: string;
+  ledger_revision?: number | null;
+  stage?: "planner" | "jev";
+  jev_enabled?: boolean;
+};
+export type LedgerEvidence = {
+  quote: string;
+};
+export type LedgerEvent = {
+  kind: "add" | "replace_amount" | "cancel" | "set_scalar";
+  label?: string;
+  amount_id?: string;
+  field?: string;
+  amount?: string | number;
+  value?: string | number;
+  value_quote?: string;
+  evidence: LedgerEvidence;
+};
+export type LedgerRecord = {
+  amount_id: string;
+  label: string;
+  amount: string | number;
+  source_quote: string;
+  active: boolean;
+};
+export type LedgerRevision = {
+  origin?: "model" | "user";
+  revision: number;
+  parent_revision: number | null;
+  source_text?: string;
+  source_sha256: string;
+  events: LedgerEvent[];
+  records: LedgerRecord[];
+  recipient?: string | null;
+  project?: string | null;
+  unit?: string | null;
+  surcharge_percent?: string | number | null;
+  budget?: string | number | null;
+  effective?: {
+    active_amounts: Array<string | number>;
+    surcharge_percent?: string | number | null;
+    budget?: string | number | null;
+    recipient?: string | null;
+    project?: string | null;
+    unit?: string | null;
+  };
+};
+export type PrivateLedgerCandidate = {
+  proposal_id: string;
+  candidate: LedgerRevision;
+};
+export type PrivateLedgerProposalResult =
+  PrivateLedgerCandidate | { status: "no_changes"; base_revision: number };
 export type Bootstrap = {
   csrf: string;
   provider: string;
   model: string;
   detector: string;
   state_enabled?: boolean;
+  persistence_enabled?: boolean;
 };
-export type SessionIdentity = { id: string; provider: string; model: string };
+export type SessionSummary = {
+  id: string;
+  title: string;
+  provider: string;
+  model: string;
+  updated_at?: string | null;
+  message_count?: number;
+  private_work_count?: number;
+  recovery_status?: string | null;
+  provider_confirmed?: boolean;
+};
+export type SessionList = { sessions: SessionSummary[] };
+export type SessionIdentity = {
+  id: string;
+  provider: string;
+  model: string;
+  title?: string;
+  provider_confirmed?: boolean;
+  recovery_status?: string | null;
+};
+
+export type SessionMutationKind = "new" | "switch" | "delete" | "rename";
+export type SessionMutation = {
+  kind: SessionMutationKind;
+  session_id?: string;
+  status: "busy" | "unknown";
+};
 
 export type InspectTab = "preview" | "json" | "evidence";

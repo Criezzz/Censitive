@@ -13,20 +13,23 @@ export function PrivacyPanel(props: PanelProps) {
     preview,
     semantic,
     terms,
-    busy,
     inspect,
     factsConfirmed,
     identityConfirmed,
     model,
     localModel,
     pendingReview,
+    privatePhase,
+    busy,
   } = props.model;
   const { changeTerms, setInspect, reviewPreview, send } = props.actions;
+  const policyLocked = busy;
   return (
     <aside
       className="privacy-panel"
       id="privacy-panel"
       aria-label="Kiểm tra riêng tư"
+      tabIndex={-1}
     >
       <div className="panel-title">
         <div className="panel-symbol">
@@ -39,7 +42,13 @@ export function PrivacyPanel(props: PanelProps) {
           </p>
         </div>
         <span className={`status-pill ${preview ? "ready" : ""}`}>
-          {preview ? "Sẵn sàng" : "Chờ nội dung"}
+          {phase === "sending"
+            ? "Đang gửi"
+            : phase === "preparing"
+              ? "Đang phân tích"
+              : preview
+                ? "Chờ duyệt"
+                : "Chưa gửi"}
         </span>
       </div>
       <div className="detector-status" role="status">
@@ -75,7 +84,7 @@ export function PrivacyPanel(props: PanelProps) {
           autoComplete="off"
           value={terms}
           maxLength={6030}
-          disabled={busy}
+          disabled={policyLocked}
           onChange={(e) => changeTerms(e.target.value)}
           placeholder={"Mỗi dòng một cụm, ví dụ:\nLan\nMaple"}
         />
@@ -97,6 +106,7 @@ export function PrivacyPanel(props: PanelProps) {
             <div className="preview-tabs">
               <button
                 className={inspect === "preview" ? "selected" : ""}
+                aria-pressed={inspect === "preview"}
                 onClick={() => setInspect("preview")}
               >
                 Nội dung
@@ -104,6 +114,7 @@ export function PrivacyPanel(props: PanelProps) {
               {preview.semantic && (
                 <button
                   className={inspect === "evidence" ? "selected" : ""}
+                  aria-pressed={inspect === "evidence"}
                   onClick={() => setInspect("evidence")}
                 >
                   Phát hiện ({preview.semantic.findings.length})
@@ -111,6 +122,7 @@ export function PrivacyPanel(props: PanelProps) {
               )}
               <button
                 className={inspect === "json" ? "selected" : ""}
+                aria-pressed={inspect === "json"}
                 onClick={() => setInspect("json")}
               >
                 Body JSON
@@ -125,7 +137,7 @@ export function PrivacyPanel(props: PanelProps) {
                 </p>
               )}
             {inspect !== "evidence" && (
-              <pre className="preview-content" aria-label="Bản đã che">
+              <pre className="preview-content" aria-label="Bản chuẩn bị gửi">
                 {inspect === "preview"
                   ? preview.sanitized
                   : JSON.stringify(JSON.parse(preview.body), null, 2)}
@@ -140,6 +152,14 @@ export function PrivacyPanel(props: PanelProps) {
                 bị lại.
                 {codex &&
                   " JSON này là hội thoại gửi vào Codex; CLI bổ sung chỉ dẫn cố định và metadata giao thức."}
+              </p>
+            )}
+            {preview.context && (
+              <p className="preview-detail" aria-label="Ngữ cảnh gửi provider">
+                Gửi đủ {preview.context.message_count} tin nhắn đã lọc; không
+                cắt lịch sử. Kích thước bản duyệt: {preview.context.body_bytes}/
+                {preview.context.body_limit_bytes} byte. Chưa đo số token của
+                model; đây không phải giới hạn context window của model.
               </p>
             )}
             {preview.semantic && inspect === "evidence" && (
@@ -223,7 +243,7 @@ export function PrivacyPanel(props: PanelProps) {
                     </p>
                     <button
                       type="button"
-                      disabled={busy || !item.can_reject}
+                      disabled={policyLocked || !item.can_reject}
                       onClick={() => void reviewPreview(item.candidate_id)}
                     >
                       Không che đề xuất này trong bản gửi này
@@ -244,13 +264,26 @@ export function PrivacyPanel(props: PanelProps) {
           </div>
         )}
       </div>
+      <div className="scope-note">
+        <span>i</span>
+        <p>
+          <strong>Bạn vẫn quyết định bản gửi</strong>
+          {semantic
+            ? "Model có thể bỏ sót hoặc che quá nhiều. Kiểm tra ngữ cảnh còn lại và bổ sung cụm bảo vệ khi cần."
+            : "Bộ lọc quy tắc chưa nhận diện ngữ nghĩa. Kiểm tra nội dung và bổ sung các cụm cần giữ riêng."}
+        </p>
+      </div>
       {preview && (
         <div className="approval-footer">
           <button
             className="approve-btn"
             onClick={() => void send()}
             disabled={
-              phase !== "ready" || !factsConfirmed || !identityConfirmed
+              phase !== "ready" ||
+              !factsConfirmed ||
+              !identityConfirmed ||
+              privatePhase !== "idle" ||
+              busy
             }
           >
             <Shield small /> Duyệt & gửi bản này <span>→</span>
@@ -282,15 +315,6 @@ export function PrivacyPanel(props: PanelProps) {
         </div>
       )}
       <ProtectionPanel {...props} />
-      <div className="scope-note">
-        <span>i</span>
-        <p>
-          <strong>Bạn vẫn quyết định bản gửi</strong>
-          {semantic
-            ? "Model có thể bỏ sót hoặc che quá nhiều. Kiểm tra ngữ cảnh còn lại và bổ sung cụm bảo vệ khi cần."
-            : "Bộ lọc quy tắc chưa nhận diện ngữ nghĩa. Kiểm tra nội dung và bổ sung các cụm cần giữ riêng."}
-        </p>
-      </div>
     </aside>
   );
 }

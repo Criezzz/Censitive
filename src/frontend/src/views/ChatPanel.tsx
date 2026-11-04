@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { PanelProps } from "./PanelProps";
 import { samples } from "../data/samples";
 import { AuditPanel } from "./AuditPanel";
@@ -10,7 +11,6 @@ export function ChatPanel(props: PanelProps) {
     messages,
     provisional,
     semantic,
-    busy,
     phase,
     cancelPending,
     cloud,
@@ -19,12 +19,14 @@ export function ChatPanel(props: PanelProps) {
     draft,
     session,
     providerConfirmed,
+    recoveryStatus,
     factsConfirmed,
     identityConfirmed,
     factState,
     draftSelection,
     selectionIssue,
     selectionNotice,
+    busy,
   } = props.model;
   const {
     semanticSample,
@@ -38,20 +40,48 @@ export function ChatPanel(props: PanelProps) {
     cancel,
   } = props.actions;
   const { bottom, input } = props.elements;
+  const chatInputLocked = busy;
+  const followLatest = useRef(true);
+  useEffect(() => {
+    followLatest.current = true;
+  }, [session]);
+  useEffect(() => {
+    const container = bottom.current?.parentElement;
+    if (!container) return;
+    if (messages.length === 0 && provisional === null) {
+      container.scrollTop = 0;
+      followLatest.current = true;
+    } else if (followLatest.current)
+      container.scrollTop = container.scrollHeight;
+  }, [messages, provisional, bottom]);
   return (
-    <section className="conversation" id="chat-panel" aria-label="Hội thoại">
-      <h2 className="sr-only">Nội dung hội thoại</h2>
-      <div className="chat-scroll">
+    <section
+      className="conversation"
+      id="chat-panel"
+      aria-label="Hội thoại"
+      tabIndex={-1}
+    >
+      <div className="conversation-heading">
+        <h2>Nội dung hội thoại</h2>
+        <span>Bản gốc · trên máy</span>
+      </div>
+      <div
+        className="chat-scroll"
+        onScroll={(event) => {
+          const container = event.currentTarget;
+          followLatest.current =
+            container.scrollHeight -
+              container.scrollTop -
+              container.clientHeight <
+            80;
+        }}
+      >
         {messages.length === 0 && provisional === null ? (
           <div className="welcome">
             <div className="welcome-icon">
               <Shield />
             </div>
-            <h2>
-              Có những điều
-              <br />
-              nên ở lại đây.
-            </h2>
+            <h2>Bạn muốn trao đổi điều gì?</h2>
             <p>
               {semantic
                 ? "Qwen đọc ngữ cảnh ngay trên máy để đề xuất che thông tin nhạy cảm. Bạn xem lại bản gửi trước khi provider trả lời."
@@ -60,7 +90,7 @@ export function ChatPanel(props: PanelProps) {
             {semantic && (
               <button
                 className="semantic-example"
-                disabled={busy}
+                disabled={chatInputLocked}
                 onClick={semanticSample}
               >
                 <strong>Thử một kế hoạch chưa công bố</strong>
@@ -72,7 +102,7 @@ export function ChatPanel(props: PanelProps) {
                 <button
                   key={sample.title}
                   onClick={() => useSample(sample)}
-                  disabled={busy}
+                  disabled={chatInputLocked}
                   className="sample"
                 >
                   <span className="sample-icon">{sample.icon}</span>
@@ -165,7 +195,7 @@ export function ChatPanel(props: PanelProps) {
             }
             value={draft}
             maxLength={20000}
-            disabled={busy}
+            disabled={chatInputLocked}
             placeholder="Nhập nội dung cần soạn, tóm tắt hoặc trao đổi…"
             onChange={(e) => changeDraft(e.target.value)}
             onKeyDown={(e) => {
@@ -197,7 +227,7 @@ export function ChatPanel(props: PanelProps) {
                 type="button"
                 aria-describedby="selection-scope"
                 disabled={
-                  busy ||
+                  chatInputLocked ||
                   !session ||
                   !providerConfirmed ||
                   !factsConfirmed ||
@@ -240,16 +270,22 @@ export function ChatPanel(props: PanelProps) {
               >
                 Hủy lượt
               </button>
+            ) : phase === "ready" ? (
+              <a className="review-link" href="#privacy-panel">
+                Kiểm tra bản gửi →
+              </a>
             ) : (
               <button
                 className="primary"
                 disabled={
                   !session ||
                   !draft.trim() ||
-                  busy ||
+                  chatInputLocked ||
                   !providerConfirmed ||
                   !factsConfirmed ||
-                  !identityConfirmed
+                  !identityConfirmed ||
+                  recoveryStatus === "unknown_send" ||
+                  recoveryStatus === "storage_failed"
                 }
                 onClick={() => void prepare()}
               >

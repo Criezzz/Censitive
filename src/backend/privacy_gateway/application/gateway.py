@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -13,8 +14,22 @@ from typing import TYPE_CHECKING
 
 from privacy_gateway.adapters.fake_provider import FakeProvider
 from privacy_gateway.adapters.local_detector import SemanticDetector
-from privacy_gateway.adapters.provider import Provider, StreamingProvider, serialize_request
+from privacy_gateway.adapters.provider import (
+    Provider,
+    ProviderNotDispatched,
+    StreamingProvider,
+    serialize_request,
+)
+from privacy_gateway.application.private_work import (
+    JevGateBlocked,
+    JevPreviewReady,
+    PreparedWork,
+    PrivateWorkbench,
+    PrivateWorker,
+    WorkResult,
+)
 from privacy_gateway.application.session_records import (
+    PrivateWorkRecord,
     ProviderRecord,
     SendMarkerRecord,
     SessionStore,
@@ -30,6 +45,8 @@ from privacy_gateway.domain.identity import (
     verify_draft_identity,
 )
 from privacy_gateway.domain.incremental import Compilation, CompiledSource, compile_state
+from privacy_gateway.domain.jev import JevAssessment
+from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES, MAX_REQUEST_BYTES
 from privacy_gateway.domain.manual_facts import (
     CreateFact,
     DraftFacts,
@@ -45,6 +62,15 @@ from privacy_gateway.domain.preview_review import (
     reviewed_state,
     validate_review_command,
 )
+from privacy_gateway.domain.private_ledger import (
+    CURRENT_PARSER_VERSION,
+    LedgerRevision,
+    NoLedgerChanges,
+    PrivateLedger,
+    append_revision,
+    current_revision,
+    validate_revision,
+)
 from privacy_gateway.domain.redaction import (
     PREFIX,
     TOKEN,
@@ -59,12 +85,18 @@ from privacy_gateway.domain.semantic import Protection, SemanticReport
 from privacy_gateway.domain.serialization import strict_json
 from privacy_gateway.domain.state import State, unique_span
 from privacy_gateway.domain.streaming import IncrementalRestorer
+from privacy_gateway.domain.structured_ledger import (
+    StructuredLedgerValues,
+    structured_revision,
+    structured_source,
+)
 
 if TYPE_CHECKING:
     from privacy_gateway.adapters.state_resolver import Resolution, StateResolver
 
-MAX_MESSAGES = 40
-MAX_BODY = 200_000
+MAX_BODY = MAX_REQUEST_BYTES
+MAX_SESSION_RECORD_BYTES = 4 * 1024 * 1024
+PRIVATE_WORK_RECORD_RESERVE_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -112,6 +144,32 @@ class CommandReceipt:
     body_sha256: str = ""
 
 
+@dataclass(frozen=True)
+class PrivateWork:
+    id: str
+    public_task: str
+    private_context: str = field(repr=False)
+    answer: str = field(repr=False)
+    route: str
+    public_body_sha256: str
+    provider: str
+    model: str
+    trace: tuple[str, ...] = ()
+    plan: dict[str, object] | None = field(default=None, repr=False)
+    ledger_revision: int | None = None
+    jev: JevAssessment | None = None
+
+
+@dataclass(frozen=True)
+class PendingLedger:
+    id: str
+    request_id: str
+    candidate: LedgerRevision
+    base_revision: int
+    session_version: int
+    expires_at: float
+
+
 @dataclass
 class Session:
     id: str
@@ -121,12 +179,14 @@ class Session:
     terms: tuple[str, ...] = ()
     private_history: list[Message] = field(default_factory=list)
     provider_history: list[Message] = field(default_factory=list)
+    private_work_history: list[PrivateWork] = field(default_factory=list)
+    private_ledger_history: list[LedgerRevision] = field(default_factory=list)
     vault: dict[str, Binding] = field(default_factory=dict)
     prepared: Prepared | None = None
     preparing_id: str | None = None
     cancelled_prepares: set[str] = field(default_factory=set)
     active_id: str | None = None
-    active_task: asyncio.Task[str] | None = None
+    active_task: asyncio.Task[object] | None = None
     cancelled: bool = False
     closed: bool = False
     audit: list[dict[str, str | int]] = field(default_factory=list)
@@ -140,6 +200,14 @@ class Session:
     processing_mode: str = "rules"
     send_marker: SendMarkerRecord | None = None
     persistence_failed: bool = False
+    private_workbench: PrivateWorkbench | None = field(default=None, repr=False)
+    private_prepared: PreparedWork | None = field(default=None, repr=False)
+    private_prepared_version: int | None = field(default=None, repr=False)
+    private_prepared_expires_at: float | None = field(default=None, repr=False)
+    private_selected_signature: tuple[str, str, str] | None = field(default=None, repr=False)
+    private_prepared_ledger_revision: int | None = field(default=None, repr=False)
+    private_ledger_candidate: PendingLedger | None = field(default=None, repr=False)
+    latest_jev: JevAssessment | None = None
 
     @property
     def busy(self) -> bool:
@@ -158,12 +226,16 @@ class Gateway:
         *,
         resolver: StateResolver | None = None,
         store: SessionStore | None = None,
+        private_worker: PrivateWorker | None = None,
+        ledger_proposer: object | None = None,
     ) -> None:
         self.sessions: dict[str, Session] = {}
         self.provider = provider or FakeProvider()
         self.detector = detector
         self.resolver = resolver
         self.store = store
+        self.private_worker = private_worker
+        self.ledger_proposer = ledger_proposer
 
     def _ensure_writable(self, session: Session, *, allow_unknown: bool = False) -> None:
         if session.closed:
@@ -217,7 +289,20 @@ class Gateway:
             Message(item.role, item.content, item.provider, item.source_id)
             for item in record.provider_history
         ]
+        session.private_work_history = [item.to_domain() for item in record.private_work_history]
+        try:
+            session.private_ledger_history = list(record.private_ledger_history)
+            ledger: PrivateLedger | None = None
+            for revision in session.private_ledger_history:
+                ledger = append_revision(ledger, revision)
+        except PrivacyError:
+            raise PrivacyError("SESSION_RECORD_INVALID") from None
         session.vault = {item.token: item.to_domain() for item in record.vault}
+        try:
+            for message in session.provider_history:
+                validate_tokens(message.content, session.vault)
+        except PrivacyError:
+            raise PrivacyError("SESSION_RECORD_INVALID") from None
         session.state = record.state.to_domain()
         session.commands = {key: item.to_domain() for key, item in record.commands.items()}
         session.terms = tuple(record.terms)
@@ -232,6 +317,13 @@ class Gateway:
         session.recovery_status = (
             "unknown_send" if record.send_marker is not None else "provider_unavailable"
         )
+        session.private_workbench = None
+        session.private_prepared = None
+        session.private_prepared_version = None
+        session.private_prepared_expires_at = None
+        session.private_prepared_ledger_revision = None
+        session.private_selected_signature = None
+        session.private_ledger_candidate = None
         session.compiled_sources = ()
         self.sessions[session.id] = session
         return session
@@ -307,6 +399,8 @@ class Gateway:
 
     def rename_session(self, session: Session, title: str) -> None:
         self._ensure_writable(session)
+        if session.busy:
+            raise PrivacyError("SESSION_BUSY")
         if type(title) is not str or not title.strip() or len(title) > 120:
             raise PrivacyError("INVALID_TITLE")
         try:
@@ -315,6 +409,7 @@ class Gateway:
             raise PrivacyError("INVALID_TITLE") from None
         previous_title = session.title
         previous_version = session.version
+        self._drop_private_preview(session)
         session.title = title.strip()
         session.version += 1
         try:
@@ -324,17 +419,641 @@ class Gateway:
             session.version = previous_version
             raise
 
+    @staticmethod
+    def _private_signature(provider: Provider) -> tuple[str, str, str]:
+        return (provider.provider_id, provider.model, provider.serializer_version)
+
+    def _ledger_proposer(self) -> object | None:
+        if self.ledger_proposer is not None:
+            return self.ledger_proposer
+        if self.private_worker is None:
+            return None
+        try:
+            from privacy_gateway.adapters.local_ledger import LocalLedgerProposer
+            from privacy_gateway.adapters.local_private_worker import LocalPrivateWorker
+
+            if isinstance(self.private_worker, LocalPrivateWorker):
+                self.ledger_proposer = LocalLedgerProposer(self.private_worker)
+        except (ImportError, TypeError):
+            return None
+        return self.ledger_proposer
+
+    def private_ledger_available(self, session: Session | None = None) -> bool:
+        proposer = self._ledger_proposer()
+        if proposer is not None and callable(getattr(proposer, "propose", None)):
+            return True
+        if session is not None:
+            return any(
+                item.ledger_revision is not None and item.plan
+                for item in session.private_work_history
+            )
+        return False
+
+    @staticmethod
+    def _ledger_revision(session: Session, revision: int) -> LedgerRevision:
+        if type(revision) is not int or revision < 1:
+            raise PrivacyError("LEDGER_REVISION_INVALID")
+        item = next(
+            (
+                candidate
+                for candidate in session.private_ledger_history
+                if candidate.revision == revision
+            ),
+            None,
+        )
+        if item is None:
+            raise PrivacyError("LEDGER_REVISION_STALE")
+        ledger: PrivateLedger | None = None
+        for stored in session.private_ledger_history:
+            ledger = append_revision(ledger, stored)
+            if stored.revision == revision:
+                found = current_revision(ledger)
+                if found is None:
+                    raise PrivacyError("LEDGER_STATE_INVALID")
+                return found
+        raise PrivacyError("LEDGER_REVISION_STALE")
+
+    @staticmethod
+    def _ledger_current(session: Session) -> LedgerRevision | None:
+        if not session.private_ledger_history:
+            return None
+        ledger: PrivateLedger | None = None
+        try:
+            for revision in session.private_ledger_history:
+                ledger = append_revision(ledger, revision)
+        except PrivacyError:
+            raise PrivacyError("LEDGER_STATE_INVALID") from None
+        return current_revision(ledger)
+
+    def _drop_ledger_candidate(self, session: Session) -> None:
+        session.private_ledger_candidate = None
+
+    async def propose_private_ledger(
+        self,
+        session: Session,
+        private_source: str,
+        base_revision: int,
+        request_id: str,
+        *,
+        structured_values: StructuredLedgerValues | None = None,
+    ) -> PendingLedger | NoLedgerChanges:
+        self._ensure_writable(session)
+        if session.busy or session.preparing_id is not None:
+            raise PrivacyError("SESSION_BUSY")
+        if type(request_id) is not str or not re.fullmatch(r"[0-9a-f]{32}", request_id):
+            raise PrivacyError("REQUEST_ID_INVALID")
+        if structured_values is not None:
+            private_source = structured_source(structured_values)
+        if type(private_source) is not str or not private_source or len(private_source) > 4_000:
+            raise PrivacyError("LEDGER_SOURCE_INVALID")
+        try:
+            private_source.encode("utf-8")
+        except UnicodeError:
+            raise PrivacyError("LEDGER_SOURCE_INVALID") from None
+        proposer = self._ledger_proposer() if structured_values is None else None
+        proposer_fn = getattr(proposer, "propose", None)
+        if structured_values is None and not callable(proposer_fn):
+            raise PrivacyError("PRIVATE_LEDGER_UNAVAILABLE")
+        current = self._ledger_current(session)
+        expected_base = current.revision if current is not None else 0
+        if type(base_revision) is not int or base_revision != expected_base:
+            self._drop_ledger_candidate(session)
+            raise PrivacyError("LEDGER_REVISION_STALE")
+        self._drop_ledger_candidate(session)
+        if session.prepared is not None or session.private_prepared is not None:
+            self.discard(session)
+        else:
+            self._drop_private_preview(session)
+        start_version = session.version
+        session.cancelled = False
+        session.active_id = request_id
+
+        async def propose() -> object:
+            if structured_values is not None:
+                return structured_revision(structured_values, current)
+            assert callable(proposer_fn)
+            return await proposer_fn(private_source, current)
+
+        task = asyncio.create_task(propose())
+        session.active_task = task
+        try:
+            candidate = await task
+            if session.cancelled or session.closed:
+                raise PrivacyError("CANCELLED")
+            if session.version != start_version:
+                raise PrivacyError("SESSION_CHANGED")
+            if candidate is NoLedgerChanges.NO_CHANGES:
+                session.record("ledger_propose", "no_changes")
+                return candidate
+            if type(candidate) is not LedgerRevision:
+                raise PrivacyError("LEDGER_PROPOSAL_INVALID")
+            if candidate.parser_version != CURRENT_PARSER_VERSION:
+                raise PrivacyError("LEDGER_PROPOSAL_INVALID")
+            if candidate.origin != ("user" if structured_values is not None else "model"):
+                raise PrivacyError("LEDGER_PROPOSAL_INVALID")
+            if candidate.source_text != private_source:
+                raise PrivacyError("LEDGER_PROPOSAL_INVALID")
+            candidate = validate_revision(candidate, current)
+            pending = PendingLedger(
+                secrets.token_hex(16),
+                request_id,
+                candidate,
+                base_revision,
+                start_version,
+                time.monotonic() + 300,
+            )
+            session.private_ledger_candidate = pending
+            session.record("ledger_propose", "ready")
+            return pending
+        except asyncio.CancelledError:
+            raise PrivacyError("CANCELLED") from None
+        finally:
+            session.active_id = None
+            session.active_task = None
+
+    def confirm_private_ledger(self, session: Session, proposal_id: str) -> LedgerRevision:
+        self._ensure_writable(session)
+        if session.busy or session.preparing_id is not None:
+            raise PrivacyError("SESSION_BUSY")
+        pending = session.private_ledger_candidate
+        if (
+            pending is None
+            or type(proposal_id) is not str
+            or not secrets.compare_digest(pending.id.encode(), proposal_id.encode())
+        ):
+            raise PrivacyError("LEDGER_PROPOSAL_NOT_FOUND")
+        current = self._ledger_current(session)
+        current_revision_number = current.revision if current is not None else 0
+        if (
+            pending.session_version != session.version
+            or pending.base_revision != current_revision_number
+            or time.monotonic() >= pending.expires_at
+            or pending.candidate.parent_revision != (current.revision if current else None)
+            or pending.candidate.revision != current_revision_number + 1
+        ):
+            self._drop_ledger_candidate(session)
+            raise PrivacyError("LEDGER_PROPOSAL_STALE")
+        old_history = session.private_ledger_history.copy()
+        old_version = session.version
+        old_candidate = pending
+        old_private_prepared = session.private_prepared
+        old_private_workbench = session.private_workbench
+        old_private_prepared_version = session.private_prepared_version
+        old_private_prepared_expires_at = session.private_prepared_expires_at
+        old_private_selected_signature = session.private_selected_signature
+        old_private_prepared_ledger_revision = session.private_prepared_ledger_revision
+        self._drop_private_preview(session)
+        try:
+            ledger: PrivateLedger | None = None
+            for revision in old_history:
+                ledger = append_revision(ledger, revision)
+            ledger = append_revision(ledger, pending.candidate)
+            session.private_ledger_history = list(ledger.revisions)
+            session.version += 1
+            session.private_ledger_candidate = None
+            session.record("ledger_confirm", "committed")
+            self._persist(session)
+        except PrivacyError:
+            session.private_ledger_history = old_history
+            session.version = old_version
+            session.private_ledger_candidate = old_candidate
+            session.private_prepared = old_private_prepared
+            session.private_workbench = old_private_workbench
+            session.private_prepared_version = old_private_prepared_version
+            session.private_prepared_expires_at = old_private_prepared_expires_at
+            session.private_selected_signature = old_private_selected_signature
+            session.private_prepared_ledger_revision = old_private_prepared_ledger_revision
+            raise
+        return pending.candidate
+
+    def _drop_private_preview(self, session: Session, *, discard_work: bool = True) -> None:
+        prepared = session.private_prepared
+        if discard_work and prepared is not None and session.private_workbench is not None:
+            session.private_workbench.discard(prepared.id)
+        session.private_prepared = None
+        session.private_prepared_version = None
+        session.private_prepared_expires_at = None
+
+    def _private_workbench(self, session: Session, workbench: PrivateWorkbench) -> PrivateWorkbench:
+        if self.private_worker is None:
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        if workbench.worker is not self.private_worker:
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        planner = workbench.planner
+        if (planner.provider_id, planner.model) != (
+            session.provider.provider_id,
+            session.provider.model,
+        ):
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        if session.private_workbench is not workbench:
+            self._drop_private_preview(session)
+            session.private_workbench = workbench
+        return workbench
+
+    @staticmethod
+    def _validate_public_private_boundary(session: Session, public_task: str) -> None:
+        if PREFIX in public_task:
+            raise PrivacyError("RESERVED_TOKEN")
+        protected = tuple(
+            dict.fromkeys(
+                (
+                    *session.terms,
+                    *session.literal_policies,
+                    *(b.value for b in session.vault.values() if not b.scope),
+                )
+                + session.state.denied_literals,
+            )
+        )
+        if detect(public_task, protected, merge_overlaps=True):
+            raise PrivacyError("OUTBOUND_BLOCKED")
+
+    def prepare_private_work(
+        self,
+        session: Session,
+        workbench: PrivateWorkbench,
+        public_task: str,
+        private_context: str,
+        *,
+        expected_version: int | None = None,
+        expected_signature: tuple[str, str, str] | None = None,
+        ledger_revision: int | None = None,
+    ) -> PreparedWork:
+        self._ensure_writable(session)
+        if expected_version is not None and session.version != expected_version:
+            raise PrivacyError("SESSION_CHANGED")
+        if (
+            expected_signature is not None
+            and self._private_signature(session.provider) != expected_signature
+        ):
+            raise PrivacyError("SESSION_CHANGED")
+        if not session.provider_confirmed or self.private_worker is None:
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        if session.preparing_id is not None or session.busy:
+            raise PrivacyError("SESSION_BUSY")
+        if ledger_revision is not None and private_context != "":
+            raise PrivacyError("LEDGER_CONTEXT_CONFLICT")
+        self.discard(session)
+        if not isinstance(public_task, str) or not public_task.strip() or len(public_task) > 3_000:
+            raise PrivacyError("PUBLIC_TASK_INVALID")
+        selected_ledger: LedgerRevision | None = None
+        if ledger_revision is not None:
+            selected_ledger = self._ledger_revision(session, ledger_revision)
+            if session.private_ledger_history[-1].revision != ledger_revision:
+                raise PrivacyError("LEDGER_REVISION_STALE")
+            from privacy_gateway.adapters.local_ledger import (
+                PUBLIC_LEDGER_TASK_PREFIX,
+                LedgerWorker,
+            )
+
+            self._validate_public_private_boundary(session, public_task)
+            if len(PUBLIC_LEDGER_TASK_PREFIX) + len(public_task) > 3_000:
+                raise PrivacyError("PUBLIC_TASK_INVALID")
+            public_task = PUBLIC_LEDGER_TASK_PREFIX + public_task
+            private_context = selected_ledger.source_text
+            base = next(
+                (
+                    item
+                    for item in session.private_ledger_history
+                    if item.revision == selected_ledger.revision - 1
+                ),
+                None,
+            )
+            workbench = PrivateWorkbench(
+                workbench.planner, LedgerWorker(selected_ledger, base), workbench.gate
+            )
+            self._drop_private_preview(session)
+            session.private_workbench = workbench
+        else:
+            self._validate_public_private_boundary(session, public_task)
+            workbench = self._private_workbench(session, workbench)
+        if len(session.private_work_history) >= 100:
+            raise PrivacyError("PRIVATE_WORK_HISTORY_LIMIT")
+        work = workbench.prepare(public_task, private_context)
+        session.latest_jev = None
+        session.private_prepared = work
+        session.private_prepared_version = session.version
+        session.private_prepared_expires_at = time.monotonic() + 300
+        session.private_selected_signature = self._private_signature(session.provider)
+        session.private_prepared_ledger_revision = (
+            selected_ledger.revision if selected_ledger is not None else None
+        )
+        session.record("private_prepare", "ready")
+        self._persist(session)
+        return work
+
+    def _validate_jev_boundary(self, session: Session, body: bytes) -> None:
+        pending = [strict_json(body)]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                self._validate_public_private_boundary(session, item)
+            elif isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
+
+    def private_work_preview(self, session: Session) -> PreparedWork:
+        work = session.private_prepared
+        if work is None:
+            raise PrivacyError("PRIVATE_WORK_NOT_FOUND")
+        if (
+            session.private_prepared_version != session.version
+            or session.private_selected_signature != self._private_signature(session.provider)
+            or session.private_prepared_expires_at is None
+            or time.monotonic() >= session.private_prepared_expires_at
+        ):
+            self._drop_private_preview(session)
+            raise PrivacyError("STALE_PREVIEW")
+        planner = (
+            session.private_workbench.planner if session.private_workbench is not None else None
+        )
+        if (
+            planner is None
+            or (planner.provider_id, planner.model)
+            != (session.provider.provider_id, session.provider.model)
+            or session.private_workbench is None
+            or work.provider_signature != session.private_workbench._signature(work.stage)
+            or work.gate_signature
+            != (
+                session.private_workbench.gate.signature
+                if session.private_workbench.gate is not None
+                else None
+            )
+        ):
+            self._drop_private_preview(session)
+            raise PrivacyError("STALE_PREVIEW")
+        return work
+
+    async def send_private_work(
+        self, session: Session, prepared_id: str, workbench: PrivateWorkbench | None = None
+    ) -> str:
+        self._ensure_writable(session)
+        if not session.provider_confirmed or self.private_worker is None:
+            raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        if session.busy:
+            raise PrivacyError("SESSION_BUSY")
+        work = self.private_work_preview(session)
+        ledger_revision = session.private_prepared_ledger_revision
+        if not secrets.compare_digest(work.id.encode(), prepared_id.encode()):
+            raise PrivacyError("STALE_PREVIEW")
+        current = session.private_workbench
+        if current is None:
+            if workbench is None:
+                raise PrivacyError("PRIVATE_WORK_NOT_FOUND")
+            current = self._private_workbench(session, workbench)
+        elif workbench is not None and current is not workbench:
+            raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
+        if len(session.private_work_history) >= 100:
+            self._drop_private_preview(session)
+            raise PrivacyError("PRIVATE_WORK_HISTORY_LIMIT")
+        self._validate_public_private_boundary(session, work.public_task)
+        if work.stage == "jev":
+            self._validate_jev_boundary(session, work.body)
+        if self.store is not None:
+            try:
+                current_record_bytes = len(session_record(session).json_bytes())
+            except Exception:
+                raise PrivacyError("STORAGE_UNAVAILABLE") from None
+            if current_record_bytes + PRIVATE_WORK_RECORD_RESERVE_BYTES > MAX_SESSION_RECORD_BYTES:
+                self._drop_private_preview(session)
+                raise PrivacyError("PRIVATE_WORK_STORAGE_LIMIT")
+
+        self._drop_private_preview(session, discard_work=False)
+        session.active_id = work.id
+        session.cancelled = False
+        provider = session.provider
+        marker = SendMarkerRecord(
+            marker_id=secrets.token_hex(16),
+            prepared_id=work.id,
+            request_sha256=hashlib.sha256(work.body).hexdigest(),
+            provider_id=work.provider_signature[0],
+            model=work.provider_signature[1],
+            serializer_version=work.provider_signature[2],
+            original=work.private_context,
+            kind="private_work",
+            public_task=work.public_task,
+            private_context=work.private_context,
+        )
+        session.send_marker = marker
+        session.recovery_status = "unknown_send"
+        try:
+            self._persist(session)
+        except PrivacyError:
+            session.active_id = None
+            raise
+        session.record("private_dispatch", work.provider_signature[0])
+        previous_history = session.private_work_history.copy()
+        previous_version = session.version
+
+        async def consume() -> WorkResult:
+            return await current.execute(work.id, work.body)
+
+        try:
+            task = asyncio.create_task(consume())
+            session.active_task = task
+            result = await task
+            if session.cancelled or session.closed:
+                raise PrivacyError("CANCELLED")
+            answer = result.answer
+            if len(answer) > MAX_BODY or len(answer.encode("utf-8")) > MAX_BODY:
+                raise PrivacyError("RESPONSE_LIMIT")
+            entry = PrivateWork(
+                id=work.id,
+                public_task=work.public_task,
+                private_context=work.private_context,
+                answer=answer,
+                route=result.route,
+                public_body_sha256=result.public_body_sha256,
+                provider=provider.provider_id,
+                model=provider.model,
+                trace=result.trace,
+                plan=(getattr(result, "plan", None) if ledger_revision is not None else None),
+                ledger_revision=ledger_revision,
+                jev=result.jev,
+            )
+            PrivateWorkRecord.from_domain(entry)
+            session.private_work_history.append(entry)
+            session.latest_jev = result.jev
+            session.version += 1
+            session.send_marker = None
+            session.recovery_status = "none"
+            session.record("private_complete", "completed")
+            try:
+                self._persist(session)
+            except PrivacyError:
+                session.private_work_history = previous_history
+                session.version = previous_version
+                session.send_marker = marker
+                session.recovery_status = "unknown_send"
+                raise
+            return answer
+        except JevPreviewReady as pause:
+            next_work = pause.work
+            try:
+                if session.cancelled or session.closed:
+                    raise PrivacyError("CANCELLED")
+                self._validate_jev_boundary(session, next_work.body)
+                session.private_prepared = next_work
+                session.private_prepared_version = session.version
+                session.private_prepared_expires_at = time.monotonic() + 300
+                session.private_prepared_ledger_revision = ledger_revision
+                session.send_marker = None
+                session.recovery_status = "none"
+                session.record("private_plan", "jev_approval_required")
+                self._persist(session)
+            except Exception:
+                current.discard(next_work.id)
+                self._drop_private_preview(session)
+                session.send_marker = marker
+                session.recovery_status = "unknown_send"
+                raise
+            return ""
+        except JevGateBlocked as blocked:
+            session.latest_jev = blocked.assessment
+            session.send_marker = None
+            session.recovery_status = "none"
+            session.record("private_jev", blocked.assessment.decision)
+            try:
+                self._persist(session)
+            except PrivacyError:
+                session.send_marker = marker
+                session.recovery_status = "unknown_send"
+                raise
+            raise
+        except asyncio.CancelledError:
+            session.record("private_complete", "cancelled")
+            raise PrivacyError("CANCELLED") from None
+        except ProviderNotDispatched:
+            session.record("private_complete", "not_dispatched_unknown")
+            raise
+        except PrivacyError:
+            session.record("private_complete", "failed_or_cancelled")
+            raise
+        except Exception:
+            session.record("private_complete", "failed")
+            raise PrivacyError("PRIVATE_WORK_FAILED") from None
+        finally:
+            session.active_id = None
+            session.active_task = None
+            if work.stage == "jev":
+                session.latest_jev = current.latest_jev
+            if session.closed:
+                session.audit.clear()
+
+    async def rerun_private_ledger(
+        self, session: Session, work_id: str, ledger_revision: int
+    ) -> str:
+        self._ensure_writable(session)
+        if session.busy or session.preparing_id is not None:
+            raise PrivacyError("SESSION_BUSY")
+        if type(work_id) is not str or not re.fullmatch(r"[0-9a-f]{32}", work_id):
+            raise PrivacyError("PRIVATE_WORK_NOT_FOUND")
+        source = next((item for item in session.private_work_history if item.id == work_id), None)
+        if source is None or source.ledger_revision is None or not isinstance(source.plan, dict):
+            raise PrivacyError("LEDGER_RERUN_UNAVAILABLE")
+        latest = self._ledger_current(session)
+        if latest is None or ledger_revision != latest.revision:
+            raise PrivacyError("LEDGER_REVISION_STALE")
+        current = self._ledger_revision(session, ledger_revision)
+        if (
+            len(json.dumps(source.plan, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            > 16_000
+        ):
+            raise PrivacyError("PLAN_RESPONSE_INVALID")
+        from privacy_gateway.adapters.local_ledger import LedgerWorker
+        from privacy_gateway.application.private_work import execute_local_plan
+
+        base = next(
+            (
+                item
+                for item in session.private_ledger_history
+                if item.revision == ledger_revision - 1
+            ),
+            None,
+        )
+        worker = LedgerWorker(current, base)
+        previous_history = session.private_work_history.copy()
+        previous_version = session.version
+        committed = False
+        appended = False
+        session.cancelled = False
+        session.active_id = secrets.token_hex(16)
+        task = asyncio.create_task(
+            execute_local_plan(
+                source.plan,
+                worker,
+                public_task=source.public_task,
+                private_context=current.source_text,
+                public_body_sha256=source.public_body_sha256,
+                reused=True,
+            )
+        )
+        session.active_task = task
+        try:
+            result = await task
+            if session.cancelled or session.closed:
+                raise PrivacyError("CANCELLED")
+            if session.version != previous_version:
+                raise PrivacyError("SESSION_CHANGED")
+            if len(result.answer) > MAX_BODY or len(result.answer.encode("utf-8")) > MAX_BODY:
+                raise PrivacyError("RESPONSE_LIMIT")
+            entry = PrivateWork(
+                id=secrets.token_hex(16),
+                public_task=source.public_task,
+                private_context=current.source_text,
+                answer=result.answer,
+                route=result.route,
+                public_body_sha256=result.public_body_sha256,
+                provider=source.provider,
+                model=source.model,
+                trace=result.trace,
+                plan=dict(source.plan),
+                ledger_revision=ledger_revision,
+            )
+            PrivateWorkRecord.from_domain(entry)
+            if len(session.private_work_history) >= 100:
+                raise PrivacyError("PRIVATE_WORK_HISTORY_LIMIT")
+            session.private_work_history.append(entry)
+            appended = True
+            session.version += 1
+            session.record("ledger_rerun", "completed")
+            self._persist(session)
+            committed = True
+            return entry.answer
+        except asyncio.CancelledError:
+            raise PrivacyError("CANCELLED") from None
+        except PrivacyError:
+            raise
+        except Exception:
+            raise PrivacyError("PRIVATE_WORK_FAILED") from None
+        finally:
+            if not committed and not session.closed and appended:
+                session.private_work_history = previous_history
+                session.version = previous_version
+            session.active_id = None
+            session.active_task = None
+            if session.closed:
+                session.audit.clear()
+
     def discard(
         self, session: Session, prepared_id: str | None = None, *, allow_unknown: bool = False
     ) -> None:
         self._ensure_writable(session, allow_unknown=allow_unknown)
-        if prepared_id is not None and (
-            session.prepared is None or session.prepared.id != prepared_id
-        ):
+        normal_match = session.prepared is not None and (
+            prepared_id is None or session.prepared.id == prepared_id
+        )
+        private_match = session.private_prepared is not None and (
+            prepared_id is None or session.private_prepared.id == prepared_id
+        )
+        if prepared_id is not None and not normal_match and not private_match:
             return
         if session.busy:
             raise PrivacyError("SESSION_BUSY")
-        session.prepared = None
+        if normal_match:
+            session.prepared = None
+        if private_match:
+            self._drop_private_preview(session)
         session.version += 1
         self._persist(session)
 
@@ -417,7 +1136,10 @@ class Gateway:
                 term.encode("utf-8")
         except UnicodeError:
             raise PrivacyError("INVALID_INPUT") from None
-        if len(session.provider_history) >= MAX_MESSAGES:
+        if (
+            max(len(session.provider_history), len(session.private_history)) + 2
+            > MAX_HISTORY_MESSAGES
+        ):
             raise PrivacyError("HISTORY_LIMIT")
         if len(terms) > 30 or any(
             not term.strip() or len(term) > 200 or PREFIX in term for term in terms
@@ -762,7 +1484,7 @@ class Gateway:
             session.provider, [{"role": m.role, "content": m.content} for m in messages]
         )
         if len(body) > MAX_BODY:
-            raise PrivacyError("HISTORY_LIMIT")
+            raise PrivacyError("CONTEXT_LIMIT")
         allowed = set().union(*(tokens_in(m.content) for m in messages))
         prepared = Prepared(
             secrets.token_hex(16),
@@ -961,7 +1683,7 @@ class Gateway:
             session.provider, [{"role": m.role, "content": m.content} for m in messages]
         )
         if len(body) > MAX_BODY:
-            raise PrivacyError("HISTORY_LIMIT")
+            raise PrivacyError("CONTEXT_LIMIT")
         allowed = set().union(*(tokens_in(m.content) for m in messages))
         prepared = Prepared(
             secrets.token_hex(16),
@@ -980,6 +1702,7 @@ class Gateway:
             ),
             report,
             request_id,
+            expected_messages=tuple(messages),
         )
         if report is not None:
             session.processing_mode = "semantic"
@@ -1005,11 +1728,15 @@ class Gateway:
             raise PrivacyError("INVALID_PAYLOAD")
         if not isinstance(payload.get("messages"), list) or not payload["messages"]:
             raise PrivacyError("INVALID_PAYLOAD")
+        if len(payload["messages"]) > MAX_HISTORY_MESSAGES:
+            raise PrivacyError("INVALID_PAYLOAD")
         expected_payload = json.loads(serialize_request(session.provider, payload["messages"]))
         if json.dumps(payload, sort_keys=True) != json.dumps(expected_payload, sort_keys=True):
             raise PrivacyError("INVALID_PAYLOAD")
         scoped = prepared.staged_state is not None
-        expected: tuple[Message, ...] = ()
+        expected = prepared.expected_messages
+        if len(expected) != len(session.provider_history) + 1:
+            raise PrivacyError("OUTBOUND_BLOCKED")
         if prepared.staged_state is not None:
             state = prepared.staged_state
             state.validate()
@@ -1035,10 +1762,8 @@ class Gateway:
                 )
                 for m in prepared.expected_messages
             )
-            if payload["messages"] != [{"role": m.role, "content": m.content} for m in expected]:
-                raise PrivacyError("OUTBOUND_BLOCKED")
         messages = []
-        for index, message in enumerate(payload["messages"]):
+        for message in payload["messages"]:
             if (
                 not isinstance(message, dict)
                 or set(message) != {"role", "content"}
@@ -1060,12 +1785,13 @@ class Gateway:
             )
             if any(value in segment for value in forbidden for segment in segments):
                 raise PrivacyError("OUTBOUND_BLOCKED")
-            messages.append(
-                Message(
-                    message["role"], content, source_id=expected[index].source_id if scoped else ""
-                )
-            )
-        return messages
+            messages.append(Message(message["role"], content, source_id=""))
+        if payload["messages"] != [{"role": m.role, "content": m.content} for m in expected]:
+            raise PrivacyError("OUTBOUND_BLOCKED")
+        return [
+            replace(message, source_id=expected[index].source_id)
+            for index, message in enumerate(messages)
+        ]
 
     async def send(
         self,
@@ -1137,8 +1863,9 @@ class Gateway:
             return "".join(parts)
 
         try:
-            session.active_task = asyncio.create_task(consume())
-            source = await asyncio.wait_for(session.active_task, timeout=provider.timeout)
+            task = asyncio.create_task(consume())
+            session.active_task = task
+            source = await asyncio.wait_for(task, timeout=provider.timeout)
             if session.cancelled or session.closed:
                 raise PrivacyError("CANCELLED")
             if len(source) > MAX_BODY or len(source.encode("utf-8")) > MAX_BODY:
@@ -1177,6 +1904,17 @@ class Gateway:
         except asyncio.CancelledError:
             session.record("complete", "cancelled")
             raise PrivacyError("CANCELLED") from None
+        except ProviderNotDispatched:
+            session.record("complete", "not_dispatched")
+            if marker is not None and session.send_marker is marker and not session.closed:
+                session.send_marker = None
+                session.recovery_status = "none"
+                try:
+                    self._persist(session)
+                except PrivacyError:
+                    session.send_marker = marker
+                    raise
+            raise
         except PrivacyError:
             session.record("complete", "failed_or_cancelled")
             raise
@@ -1191,15 +1929,23 @@ class Gateway:
 
     def cancel(self, session: Session, prepared_id: str | None = None) -> None:
         self._ensure_writable(session, allow_unknown=True)
-        if prepared_id is not None and prepared_id not in {
+        valid_ids = {
             session.active_id,
             session.prepared.id if session.prepared else None,
-        }:
+            session.private_prepared.id if session.private_prepared else None,
+            session.private_ledger_candidate.id if session.private_ledger_candidate else None,
+            session.private_ledger_candidate.request_id
+            if session.private_ledger_candidate
+            else None,
+        }
+        if prepared_id is not None and prepared_id not in valid_ids:
             return
         if not session.cancelled and session.active_task is not None:
             session.active_task.cancel()
         session.cancelled = True
         session.prepared = None
+        self._drop_private_preview(session)
+        self._drop_ledger_candidate(session)
         session.version += 1
         session.record("cancel", "requested")
         self._persist(session)
@@ -1216,6 +1962,9 @@ class Gateway:
         session.closed = True
         session.private_history.clear()
         session.provider_history.clear()
+        session.private_work_history.clear()
+        session.private_ledger_history.clear()
+        session.private_ledger_candidate = None
         session.vault.clear()
         session.state = State()
         session.compiled_sources = ()
