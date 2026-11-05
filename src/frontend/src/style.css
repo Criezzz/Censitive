@@ -671,7 +671,7 @@ a {
   letter-spacing: 1px;
   color: #9aab8e;
 }
-.policy-section textarea {
+.policy-section input {
   display: block;
   width: 100%;
   border: 1px solid #e0e6da;
@@ -681,14 +681,12 @@ a {
   color: #47613d;
   padding: 10px 12px;
   line-height: 1.8;
-  min-height: 86px;
-  max-height: 180px;
-  resize: vertical;
+  min-width: 0;
 }
-.policy-section textarea:focus {
+.policy-section input:focus {
   border-color: #9aaf87;
 }
-.policy-section textarea::placeholder {
+.policy-section input::placeholder {
   color: #a0ab95;
 }
 .policy-section p {
@@ -810,6 +808,7 @@ a {
   font-size: 9px;
   color: #9aa58c;
   line-height: 1.8;
+  overflow-wrap: anywhere;
 }
 .detections {
   margin-top: 19px;
@@ -1275,6 +1274,19 @@ a {
   background: #fbfdfb;
   color: #27413f;
   overflow: hidden;
+}
+.private-work-toggle {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 12px 20px;
+}
+.private-work-toggle p {
+  flex: 1 1 560px;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
 }
 .private-work-heading {
   display: flex;
@@ -1743,6 +1755,7 @@ a {
   padding: 0 24px 20px;
 }
 .private-work-actions .secondary,
+.private-work-toggle .secondary,
 .private-ledger .secondary {
   padding: 9px 12px;
   border: 1px solid #c5d6c9;
@@ -1926,7 +1939,7 @@ a {
 .detections h4 {
   font-size: 10px;
 }
-.policy-section textarea,
+.policy-section input,
 .preview-content,
 .detection code,
 .approve-btn,
@@ -1962,9 +1975,7 @@ a {
 .privacy-panel .policy-section p {
   margin-bottom: 0;
 }
-.policy-section textarea {
-  min-height: 74px;
-}
+
 .panel-title {
   padding-top: 18px;
   padding-bottom: 18px;
@@ -2806,55 +2817,87 @@ h3 {
     flex-wrap: wrap;
   }
 }
-.jev-controls {
+.chat-plan {
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.chat-plan pre {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chat-execution {
+  display: block;
+  margin-top: 8px;
+  color: #526d61;
+}
+
+.protected-terms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  list-style: none;
+  padding: 0;
+  margin: 0 0 10px;
+}
+.term-chip {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.65rem;
-}
-
-.jev-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  min-height: 44px;
-  border: 1px solid currentColor;
+  gap: 6px;
+  max-width: 100%;
+  border: 1px solid #d9e6de;
   border-radius: 12px;
-  padding: 0.45rem 0.8rem;
-  color: inherit;
-  background: transparent;
+  padding: 6px 8px;
+  background: #f0f7f3;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
-
-.jev-toggle[aria-pressed="true"] {
-  color: #27634b;
-  background: #eaf5ef;
-}
-
-.jev-settings {
-  margin: 1rem 0;
-  max-width: 70ch;
-}
-
-.jev-settings p,
-.jev-report small {
-  font-size: 0.85rem;
-  line-height: 1.6;
-}
-
-.jev-key-form,
-.jev-report {
-  display: grid;
-  gap: 0.6rem;
-  padding: 1rem;
-  margin-block: 0.75rem;
-  border: 1px solid #cbd7cf;
-  border-radius: 12px;
-}
-
-.jev-key-form input {
+.term-chip span {
   min-width: 0;
-  width: 100%;
-  padding: 0.75rem;
-  border: 1px solid #8d9f94;
-  border-radius: 8px;
+}
+.term-chip small {
+  flex-basis: 100%;
+  color: #426157;
+}
+.term-entry {
+  display: flex;
+  gap: 8px;
+}
+.term-entry input {
+  flex: 1;
+}
+.term-entry button,
+.term-chip button,
+.detection button,
+.selection-notice button {
+  border: 1px solid #b7ccc1;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #fff;
+  color: #285c4c;
+  cursor: pointer;
+}
+.term-entry button:disabled,
+.term-chip button:disabled,
+.detection button:disabled,
+.selection-notice button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.preview-content mark {
+  background: #d9eee3;
+  color: #224c3c;
+  border-radius: 3px;
+}
+.detection {
+  flex-wrap: wrap;
+}
+.detection small {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.legend-token {
+  flex-basis: 100%;
 }

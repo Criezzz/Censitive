@@ -24,7 +24,6 @@ from privacy_gateway.adapters.conversation_store import (
     ConversationStoreError,
     EncryptedConversationStore,
 )
-from privacy_gateway.adapters.jev import JevGate
 from privacy_gateway.adapters.provider import StreamingProvider
 from privacy_gateway.application.gateway import (
     MAX_BODY,
@@ -34,8 +33,8 @@ from privacy_gateway.application.gateway import (
 )
 from privacy_gateway.application.private_work import PreparedWork, PrivateWorkbench
 from privacy_gateway.application.session_records import EncryptedSessionRepository
+from privacy_gateway.domain.detection import EmailReveal
 from privacy_gateway.domain.identity import DraftIdentity, IdentityCommand
-from privacy_gateway.domain.jev import JevAssessment
 from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES
 from privacy_gateway.domain.manual_facts import CreateFact, DraftFacts
 from privacy_gateway.domain.models import SpanValidationError
@@ -72,7 +71,7 @@ class PrepareInput(StrictInput):
     request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     draft_identity: DraftIdentity | None = None
     draft_facts: DraftFacts | None = None
-    jev_enabled: bool = False
+    unmask_once: list[EmailReveal] = Field(default_factory=list, max_length=30)
 
 
 class SnapshotInput(StrictInput):
@@ -83,11 +82,6 @@ class PrivateWorkPrepareInput(StrictInput):
     public_task: str = Field(min_length=1, max_length=3_000)
     private_context: str = Field(max_length=12_000)
     ledger_revision: int | None = Field(default=None, ge=1, le=32)
-    jev_enabled: bool = False
-
-
-class JevKeyInput(StrictInput):
-    key: str = Field(min_length=1, max_length=4096, repr=False)
 
 
 class PrivateLedgerProposeInput(StrictInput):
@@ -257,7 +251,6 @@ def create_app(
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.gateway = service
-    jev_gates: dict[str, JevGate] = {}
     clients: dict[str, str] = {}
     known_owners: set[str] = set()
     if conversation_store is not None:
@@ -502,41 +495,6 @@ def create_app(
         )
         return response
 
-    @app.get("/api/jev")
-    async def jev_status(request: Request) -> dict[str, bool]:
-        return {"configured": owner(request) in jev_gates}
-
-    def revoke_jev(client_owner: str) -> None:
-        sessions = service.list_sessions(client_owner)
-        if any(session.busy for session in sessions):
-            raise PrivacyError("SESSION_BUSY")
-        previous = jev_gates.pop(client_owner, None)
-        if previous is not None:
-            previous.revoke()
-        for session in sessions:
-            if session.prepared is not None and session.prepared.jev_gate is not None:
-                service.discard(session)
-            if session.private_workbench is not None and session.private_workbench.gate is not None:
-                service._drop_private_preview(session)
-
-    @app.post("/api/jev")
-    async def configure_jev(data: JevKeyInput, request: Request) -> dict[str, bool]:
-        client_owner = owner(request)
-        gate = JevGate(data.key)
-        revoke_jev(client_owner)
-        jev_gates[client_owner] = gate
-        return {"configured": True}
-
-    @app.delete("/api/jev")
-    async def remove_jev(request: Request) -> dict[str, bool]:
-        revoke_jev(owner(request))
-        return {"configured": False}
-
-    def jev_view(assessment: JevAssessment | None) -> dict[str, object] | None:
-        if assessment is None:
-            return None
-        return {**assessment.model_dump(), "estimated_usd": assessment.estimated_usd}
-
     @app.post("/api/sessions")
     async def create_session(data: CreateSessionInput, request: Request) -> dict[str, str]:
         client_owner = owner(request)
@@ -655,7 +613,6 @@ def create_app(
             "terms": session.terms,
             "busy": session.busy,
             "private_work_available": private_work_available(session),
-            "latest_jev": jev_view(session.latest_jev),
             "private_ledger_available": True,
             "private_ledger_model_available": service.private_ledger_available(session),
             "private_ledger_history": [
@@ -673,7 +630,6 @@ def create_app(
                     "model": item.model,
                     "trace": list(item.trace),
                     "ledger_revision": item.ledger_revision,
-                    "jev": jev_view(item.jev),
                     "plan": item.plan if item.ledger_revision is not None else None,
                 }
                 for item in session.private_work_history
@@ -787,8 +743,7 @@ def create_app(
         }
 
     def preview_view(prepared: Prepared, session: Session) -> dict[str, object]:
-        planner_body = prepared.planner_body if prepared.stage == "jev" else prepared.body
-        message_count = len(json.loads(planner_body or b"{}").get("messages", []))
+        message_count = len(json.loads(prepared.body).get("messages", []))
         if getattr(session.provider, "contract", "") == "chat":
             message_count -= 1
         return {
@@ -796,12 +751,9 @@ def create_app(
             "sanitized": prepared.sanitized,
             "body": prepared.body.decode("utf-8"),
             "body_sha256": hashlib.sha256(prepared.body).hexdigest(),
-            "stage": prepared.stage,
-            "jev_enabled": prepared.jev_gate is not None,
-            "provider": "typesafe-jev" if prepared.stage == "jev" else session.provider.provider_id,
-            "model": prepared.jev_signature[1]
-            if prepared.stage == "jev" and prepared.jev_signature
-            else session.provider.model,
+            "stage": "planner",
+            "provider": session.provider.provider_id,
+            "model": session.provider.model,
             "expires_in": max(0, ceil(prepared.expires_at - time.monotonic())),
             "detections": [
                 {
@@ -810,6 +762,9 @@ def create_app(
                     "category": d.category,
                     "value": prepared.original[d.start : d.end],
                     "restore_allowed": d.restore_allowed,
+                    "unmasked_once": any(
+                        (item.start, item.end) == (d.start, d.end) for item in prepared.unmask_once
+                    ),
                 }
                 for d in prepared.detections
             ],
@@ -824,8 +779,7 @@ def create_app(
                 "archive_limit_messages": MAX_HISTORY_MESSAGES,
                 "input_tokens": None,
             },
-            "streaming": prepared.stage != "jev"
-            and isinstance(session.provider, StreamingProvider),
+            "streaming": isinstance(session.provider, StreamingProvider),
             "review": None
             if prepared.review_plan is None
             else {
@@ -866,11 +820,6 @@ def create_app(
     @app.post("/api/sessions/{session_id}/prepare")
     async def prepare(session_id: str, data: PrepareInput, request: Request) -> dict[str, object]:
         session = service.session(session_id, owner(request))
-        gate = jev_gates.get(owner(request)) if data.jev_enabled else None
-        if data.jev_enabled and gate is None:
-            raise PrivacyError("JEV_KEY_REQUIRED")
-        if data.jev_enabled and getattr(session.provider, "contract", "") != "chat":
-            raise PrivacyError("JEV_CHAT_UNSUPPORTED")
         prepared = await service.prepare_message(
             session,
             data.text,
@@ -878,8 +827,8 @@ def create_app(
             data.request_id,
             draft_identity=data.draft_identity,
             draft_facts=data.draft_facts,
+            unmask_once=tuple(data.unmask_once),
         )
-        prepared = service.bind_chat_gate(session, prepared, gate)
         return preview_view(prepared, session)
 
     @app.post("/api/sessions/{session_id}/private-work/prepare")
@@ -898,10 +847,6 @@ def create_app(
             session.provider.serializer_version,
         )
         workbench = await private_workbench(session)
-        gate = jev_gates.get(owner(request)) if data.jev_enabled else None
-        if data.jev_enabled and gate is None:
-            raise PrivacyError("JEV_KEY_REQUIRED")
-        workbench = PrivateWorkbench(workbench.planner, workbench.worker, gate)
         session = service.session(session_id, owner(request))
         work = service.prepare_private_work(
             session,
@@ -922,8 +867,7 @@ def create_app(
             "public_body_sha256": hashlib.sha256(work.body).hexdigest(),
             "provider": work.provider_signature[0],
             "model": work.provider_signature[1],
-            "stage": work.stage,
-            "jev_enabled": work.gate_signature is not None,
+            "stage": "planner",
             "ledger_revision": session.private_prepared_ledger_revision,
         }
 
@@ -933,8 +877,6 @@ def create_app(
     ) -> dict[str, object]:
         session = service.session(session_id, owner(request))
         result = await service.send_private_work(session, data.prepared_id)
-        if session.private_prepared is not None and session.private_prepared.stage == "jev":
-            return {"jev_preview": private_preview_view(session.private_prepared, session)}
         return {"answer": result}
 
     @app.post("/api/sessions/{session_id}/prepared/{prepared_id}/decisions")
@@ -972,8 +914,6 @@ def create_app(
     async def send(session_id: str, data: SnapshotInput, request: Request) -> dict[str, object]:
         session = service.session(session_id, owner(request))
         result = await service.send(session, data.prepared_id)
-        if session.prepared is not None and session.prepared.stage == "jev":
-            return {"jev_preview": preview_view(session.prepared, session)}
         metadata = session.private_history[-1].metadata if session.private_history else None
         return {
             "content": result,

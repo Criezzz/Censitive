@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from privacy_gateway.domain.jev import JevAssessment
 from privacy_gateway.domain.models import SourceSpan
 from privacy_gateway.domain.private_ledger import (
     LedgerRevision,
@@ -180,12 +179,17 @@ class StateRecord(_StrictModel):
 
 
 class ChatMetadata(_StrictModel):
+    @model_validator(mode="before")
+    @classmethod
+    def discard_retired_judge(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {key: item for key, item in value.items() if key not in ("jev", "jev_status")}
+        return value
+
     route: Literal["ordinary", "derived_formula"]
     public_plan: str = Field(max_length=24_000)
     local_execution: Literal["none", "qwen"]
     derived_count: int = Field(ge=0, le=8)
-    jev_status: Literal["off", "not_applicable", "pass"]
-    jev: JevAssessment | None = None
 
 
 class MessageRecord(_StrictModel):
@@ -288,6 +292,14 @@ class SendMarkerRecord(_StrictModel):
 
 
 class PrivateWorkRecord(_StrictModel):
+    @model_validator(mode="before")
+    @classmethod
+    def discard_retired_judge(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {key: item for key, item in value.items() if key not in ("jev",)}
+        return value
+
+
     id: str = Field(pattern=r"^[0-9a-f]{32}$")
     public_task: str = Field(min_length=1, max_length=3_000)
     private_context: str = Field(max_length=12_000)
@@ -299,7 +311,6 @@ class PrivateWorkRecord(_StrictModel):
     trace: list[str] = Field(default_factory=list, max_length=32)
     plan: dict[str, object] | None = None
     ledger_revision: int | None = Field(default=None, ge=1, le=32)
-    jev: JevAssessment | None = None
 
     @field_validator("plan")
     @classmethod
@@ -336,7 +347,6 @@ class PrivateWorkRecord(_StrictModel):
             trace=list(value.trace),
             plan=value.plan,
             ledger_revision=value.ledger_revision,
-            jev=value.jev,
         )
 
     def to_domain(self) -> PrivateWork:
@@ -354,7 +364,6 @@ class PrivateWorkRecord(_StrictModel):
             trace=tuple(self.trace),
             plan=self.plan,
             ledger_revision=self.ledger_revision,
-            jev=self.jev,
         )
 
 

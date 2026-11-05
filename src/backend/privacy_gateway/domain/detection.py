@@ -1,6 +1,8 @@
 import re
 from dataclasses import dataclass
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from privacy_gateway.domain.redaction import TOKEN, PrivacyError
 from privacy_gateway.domain.semantic import Protection
 
@@ -20,6 +22,12 @@ class Detection:
     end: int
     category: str
     restore_allowed: bool
+
+
+class EmailReveal(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    start: int = Field(ge=0, lt=20_000)
+    end: int = Field(gt=0, le=20_000)
 
 
 def credential_detections(text: str) -> tuple[Detection, ...]:

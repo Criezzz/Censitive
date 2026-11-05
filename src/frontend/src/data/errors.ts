@@ -1,34 +1,38 @@
 export const errors: Record<string, string> = {
+  UNMASK_FORBIDDEN:
+    "Chỉ có thể gửi lộ email đã phát hiện cho một lần gửi. Thông tin truy cập và các bảo vệ khác vẫn phải được che. Hãy chuẩn bị lại bản gửi.",
   LEDGER_FORM_INVALID:
     "Mỗi khoản nhập tay cần một dòng Nhãn: số, ví dụ Hoa: 14.5.",
   LEDGER_NUMBER_INVALID:
     "Giá trị số chưa hợp lệ. Hãy kiểm tra số, dấu và đơn vị trong biểu mẫu.",
   LEDGER_PERCENT_INVALID:
     "Phụ phí chưa hợp lệ. Nhập tỷ lệ phần trăm rõ ràng, ví dụ 7 hoặc 7%.",
-  JEV_KEY_REQUIRED: "Cần API key TypeSafe để bật Jev. Chưa gửi Jev.",
-  JEV_KEY_INVALID: "API key Jev không hợp lệ về định dạng.",
-  JEV_PLAN_UNSUPPORTED:
-    "Jev hiện chỉ kiểm plan compute/compose. Plan này chưa được thực thi local.",
-  JEV_REJECTED:
-    "Jev phát hiện vấn đề trong kế hoạch; local worker chưa chạy. Xem quyết định bên dưới.",
-  JEV_REVIEW_REQUIRED:
-    "Jev chưa đủ chắc chắn; local worker chưa chạy. Xem quyết định bên dưới.",
-  JEV_HTTP_ERROR:
-    "TypeSafe từ chối yêu cầu. Kiểm tra key/quota; không tự thử lại hoặc tắt gate.",
-  JEV_TIMEOUT:
-    "Jev hết thời gian chờ. Request có thể đã tới TypeSafe; không tự gửi lại.",
-  JEV_CONNECTION_FAILED:
-    "Không nhận được kết quả Jev. Request có thể đã gửi; không tự thử lại.",
-  JEV_RESPONSE_INVALID:
-    "Phản hồi Jev không đúng contract; local worker chưa chạy.",
-  JEV_PAYLOAD_INVALID: "Không thể tạo payload Jev hợp lệ; chưa gửi Jev.",
-  JEV_PAYLOAD_LIMIT: "Payload Jev vượt giới hạn; chưa gửi Jev.",
   OPENAI_API_KEY_REQUIRED:
-    "Backend chưa có API key OpenAI. Cấu hình key trên máy rồi kiểm tra kết nối; không nhập key vào hội thoại.",
+    "Backend chưa có OPENAI_API_KEY. Đặt key trong cấu hình backend, khởi động lại rồi mở Provider & kết nối. Không nhập key vào hội thoại.",
   OPENAI_API_KEY_INVALID:
     "Cấu hình API key chưa hợp lệ. Kiểm tra cấu hình backend trên máy.",
   OPENAI_MODEL_REQUIRED:
-    "Backend chưa cấu hình model OpenAI API. Chọn model trong cấu hình trước khi gửi.",
+    "Backend chưa có CENSITIVE_OPENAI_MODEL. Đặt model trong cấu hình backend, khởi động lại rồi mở Provider & kết nối.",
+  OPENAI_REFUSED:
+    "OpenAI từ chối xử lý yêu cầu này. Chưa có kết quả được lưu; ứng dụng không tự gửi lại hoặc đổi provider.",
+  FORMULA_PLAN_INVALID:
+    "Kế hoạch công thức của provider không đúng hợp đồng. Chưa chạy bước tính local hoặc lưu đáp án.",
+  FORMULA_LIMIT:
+    "Kế hoạch công thức vượt giới hạn cho phép. Hãy chia yêu cầu thành các phép tính ngắn hơn.",
+  FORMULA_REFERENCE_INVALID:
+    "Công thức tham chiếu biến không hợp lệ hoặc ngoài phạm vi. Chưa thực hiện hoặc lưu đáp án.",
+  FORMULA_INPUT_FORBIDDEN:
+    "Công thức cần giá trị không được phép dùng trong lượt này. Chưa thực hiện hoặc lưu đáp án.",
+  FORMULA_INPUT_INVALID:
+    "Đầu vào công thức chưa có định dạng số được hỗ trợ. Hãy nêu rõ số và đơn vị rồi chuẩn bị lại.",
+  FORMULA_CYCLE:
+    "Các công thức phụ thuộc vòng lẫn nhau. Kế hoạch bị chặn trước khi tính local.",
+  FORMULA_OUTPUT_INVALID:
+    "Qwen chưa trả kết quả công thức hợp lệ. Chưa lưu đáp án; ứng dụng không tự tính thay hoặc chuyển bộ tính khác.",
+  FORMULA_WORKER_UNAVAILABLE:
+    "Worker Qwen tính công thức chưa sẵn sàng. Kiểm tra runtime local rồi chuẩn bị lại; chưa lưu đáp án.",
+  FORMULA_RENDER_UNSUPPORTED:
+    "Kết luận hoặc cách trình bày trong công thức chưa được hỗ trợ. Chưa thực hiện hoặc lưu đáp án.",
   OPENAI_AUTH_FAILED:
     "OpenAI API từ chối xác thực. Kiểm tra key và quyền truy cập của project; lượt này chưa được lưu.",
   OPENAI_RATE_LIMIT:

@@ -1,5 +1,4 @@
 import type {
-  JevAssessment,
   ChatMessage,
   Preview,
   PreviewDecision,
@@ -21,6 +20,7 @@ import type {
   LedgerRevision,
   PrivateLedgerCandidate,
 } from "./contracts";
+import type { previewLegend } from "./previewLegend";
 import type { Sample } from "./samples";
 import type { StructuredLedgerDraft } from "./structuredLedger";
 
@@ -49,10 +49,16 @@ export interface ChatModel {
   draftSelection: DraftOccurrence | null;
   selectionIssue: string;
   selectionNotice: string;
+  selectionUndoAvailable: boolean;
   messages: ChatMessage[];
   provisional: string | null;
   draft: string;
   terms: string;
+  draftTerms: string[];
+  appliedTerms: string[];
+  termInput: string;
+  termStatus: string;
+  legend: ReturnType<typeof previewLegend>;
   phase: Phase;
   preview: Preview | null;
   pendingReview: PreviewDecision | null;
@@ -63,12 +69,6 @@ export interface ChatModel {
   cancelPending: boolean;
   busy: boolean;
   privateWorkAvailable: boolean;
-  jevEnabled: boolean;
-  jevConfigured: boolean;
-  jevKeyOpen: boolean;
-  jevKey: string;
-  jevKeyBusy: boolean;
-  latestJev: JevAssessment | null;
   privateWorkHistory: PrivateWorkRecord[];
   privatePublicTask: string;
   privateContext: string;
@@ -92,13 +92,9 @@ export interface ChatModel {
 }
 
 export interface ChatActions {
-  toggleJev(): Promise<void>;
-  saveJevKey(): Promise<void>;
-  removeJevKey(): Promise<void>;
-  changeJevKey(key: string): void;
-  closeJevKey(): void;
   selectProvider(provider: string, model: string): Promise<void>;
   prepare(): Promise<void>;
+  revealEmail(start: number, end: number): Promise<void>;
   reviewPreview(candidateId?: string): Promise<void>;
   send(): Promise<void>;
   cancel(): Promise<void>;
@@ -112,6 +108,10 @@ export interface ChatActions {
   semanticSample(): void;
   changeDraft(text: string): void;
   changeTerms(text: string): void;
+  changeTermInput(text: string): void;
+  addTerm(): void;
+  removeTerm(term: string): void;
+  undoSelection(): void;
   selectDraft(start: number, end: number): void;
   protectSelection(): void;
   setInspect(tab: InspectTab): void;

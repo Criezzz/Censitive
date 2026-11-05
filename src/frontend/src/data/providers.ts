@@ -35,6 +35,12 @@ export type Request = <T>(
 ) => Promise<T>;
 
 export const connectionMessages: Record<string, string> = {
+  OPENAI_API_KEY_REQUIRED:
+    "Thiếu OPENAI_API_KEY. Đặt key trong cấu hình backend trên máy, khởi động lại rồi mở lại hộp này.",
+  OPENAI_API_KEY_INVALID:
+    "OPENAI_API_KEY trong backend chưa hợp lệ. Kiểm tra cấu hình trên máy rồi khởi động lại.",
+  OPENAI_MODEL_REQUIRED:
+    "Thiếu CENSITIVE_OPENAI_MODEL. Đặt model OpenAI API trong cấu hình backend rồi khởi động lại.",
   CODEX_NOT_FOUND:
     "Chưa tìm thấy Codex CLI trên máy. Cài Codex rồi kiểm tra lại.",
   CODEX_VERSION_UNVERIFIED:

@@ -1,32 +1,8 @@
+import { useState } from "react";
 import type { PanelProps } from "./PanelProps";
 import { providerName } from "../data/providers";
 import { ledgerFormFields } from "../data/structuredLedger";
-import type {
-  JevAssessment,
-  LedgerEvent,
-  LedgerRevision,
-} from "../data/contracts";
-
-function JevReport({ result }: { result: JevAssessment }) {
-  const labels = {
-    pass: "Đạt kiểm tra plan",
-    review: "Cần xem lại",
-    reject: "Không đạt kiểm tra plan",
-  };
-  return (
-    <div className="jev-report" role="status">
-      <strong>Jev: {labels[result.decision]}</strong>
-      <small>
-        {result.model} · {result.input_tokens} input tokens ·{" "}
-        {result.latency_ms} ms · khoảng ${result.estimated_usd} USD
-      </small>
-      <small>
-        Chỉ đánh giá kế hoạch công khai, chưa chứng minh dữ liệu trích xuất hoặc
-        câu trả lời đúng.
-      </small>
-    </div>
-  );
-}
+import type { LedgerEvent, LedgerRevision } from "../data/contracts";
 
 function shortHash(value: string) {
   return value.length > 16 ? `${value.slice(0, 16)}…` : value;
@@ -77,8 +53,23 @@ function eventValue(event: LedgerEvent) {
 }
 
 export function PrivateWorkPanel({ model, actions }: PanelProps) {
+  const [expanded, setExpanded] = useState(false);
+  const canCollapse =
+    !model.privateWorkAvailable &&
+    !model.privateError &&
+    !model.privateLedgerError &&
+    !model.privateLedgerNotice &&
+    !model.interruptedPrivateWork &&
+    model.privateWorkHistory.length === 0 &&
+    model.privateLedgerHistory.length === 0 &&
+    model.privatePhase === "idle" &&
+    !model.privatePreview &&
+    !model.privateCancelPending &&
+    model.privateLedgerPhase === "idle" &&
+    !model.privateLedgerCandidate &&
+    !model.privateLedgerCancelPending &&
+    !model.privateLedgerRerunPending;
   const editingLocked =
-    model.jevKeyBusy ||
     model.phase === "loading" ||
     model.phase === "preparing" ||
     model.phase === "sending" ||
@@ -131,6 +122,32 @@ export function PrivateWorkPanel({ model, actions }: PanelProps) {
     model.privatePublicTask.trim().length > 0 &&
     (usingLedger || model.privateContext.trim().length > 0);
 
+  if (canCollapse && !expanded) {
+    return (
+      <section
+        className="private-work-panel"
+        id="private-work-panel"
+        aria-label="Private work cục bộ"
+        tabIndex={-1}
+      >
+        <div className="private-work-toggle">
+          <p>
+            Việc riêng (private work) chưa khả dụng với provider hiện tại. Sổ dữ
+            liệu local vẫn dùng được.
+          </p>
+          <button
+            type="button"
+            className="secondary"
+            aria-expanded={false}
+            onClick={() => setExpanded(true)}
+          >
+            Mở rộng
+          </button>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section
       className="private-work-panel"
@@ -138,6 +155,18 @@ export function PrivateWorkPanel({ model, actions }: PanelProps) {
       aria-label="Private work cục bộ"
       tabIndex={-1}
     >
+      {canCollapse && (
+        <div className="private-work-toggle">
+          <button
+            type="button"
+            className="secondary"
+            aria-expanded={true}
+            onClick={() => setExpanded(false)}
+          >
+            Thu gọn
+          </button>
+        </div>
+      )}
       <div className="private-work-heading">
         <div>
           <span className="eyebrow">Hybrid workflow</span>
@@ -147,109 +176,13 @@ export function PrivateWorkPanel({ model, actions }: PanelProps) {
             dữ liệu riêng.
           </p>
         </div>
-        <div className="jev-controls">
-          <button
-            type="button"
-            className="jev-toggle"
-            aria-label="Jev kiểm tra kế hoạch"
-            aria-pressed={model.jevEnabled}
-            disabled={editingLocked}
-            onClick={() => void actions.toggleJev()}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              width="24"
-              height="24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              aria-hidden="true"
-            >
-              {model.jevEnabled ? (
-                <>
-                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
-                  <circle cx="12" cy="12" r="3" />
-                </>
-              ) : (
-                <>
-                  <path d="M3 9c2 4 5 6 9 6s7-2 9-6M5 12l-2 3m5-1-1 4m5-3v4m4-5 1 4m2-6 2 3" />
-                </>
-              )}
-            </svg>
-            Jev · {model.jevEnabled ? "Bật" : "Tắt"}
-          </button>
-          <span
-            className={`status-pill ${model.privateWorkAvailable ? "ready" : ""}`}
-          >
-            {model.privateWorkAvailable
-              ? "Private work đã cấu hình"
-              : "Private work chưa khả dụng"}
-          </span>
-        </div>
-      </div>
-
-      <div className="jev-settings">
-        <p>
-          Jev là bước kiểm tra plan tùy chọn của TypeSafe. Khi bật, bạn duyệt
-          riêng task và plan công khai trước khi gửi Jev. Chỉ hỗ trợ
-          compute/compose; gate đang thử nghiệm.
-        </p>
-        {model.jevConfigured && (
-          <p>
-            Đã lưu key tạm trong backend; chưa xác minh cho tới khi gọi API.{" "}
-            <button
-              type="button"
-              className="secondary"
-              disabled={editingLocked}
-              onClick={() => void actions.removeJevKey()}
-            >
-              Xóa key Jev
-            </button>
-          </p>
-        )}
-        {model.jevKeyOpen && (
-          <form
-            className="jev-key-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void actions.saveJevKey();
-            }}
-          >
-            <label htmlFor="jev-api-key">API key TypeSafe</label>
-            <input
-              id="jev-api-key"
-              type="password"
-              autoComplete="new-password"
-              maxLength={4096}
-              value={model.jevKey}
-              disabled={model.jevKeyBusy}
-              onChange={(event) => actions.changeJevKey(event.target.value)}
-            />
-            <small>
-              Key chỉ giữ trong bộ nhớ backend cho trình duyệt này, mất khi
-              backend khởi động lại. Không nhập key vào hội thoại.
-            </small>
-            <div className="jev-controls">
-              <button
-                type="submit"
-                className="primary"
-                disabled={model.jevKeyBusy || !model.jevKey.trim()}
-              >
-                Lưu key và bật Jev
-              </button>
-              <button
-                type="button"
-                className="secondary"
-                disabled={model.jevKeyBusy}
-                onClick={actions.closeJevKey}
-              >
-                Đóng
-              </button>
-            </div>
-          </form>
-        )}
-        {model.latestJev && <JevReport result={model.latestJev} />}
+        <span
+          className={`status-pill ${model.privateWorkAvailable ? "ready" : ""}`}
+        >
+          {model.privateWorkAvailable
+            ? "Private work đã cấu hình"
+            : "Private work chưa khả dụng"}
+        </span>
       </div>
 
       {model.privateError && (
@@ -285,10 +218,10 @@ export function PrivateWorkPanel({ model, actions }: PanelProps) {
         model.privateLedgerAvailable || model.privateLedgerHistory.length > 0
       ) ? (
         <div className="private-work-unavailable" role="status">
-          <strong>Luồng này cần Qwen local và Codex ChatGPT.</strong>
+          <strong>Luồng này cần worker local và provider lập kế hoạch.</strong>
           <p>
-            Chọn provider Codex đã kết nối. API/demo khác chưa được khai báo là
-            có thể chạy private work.
+            Mở Provider & kết nối để chọn OpenAI API đã cấu hình hoặc provider
+            tương thích. Kiểm tra worker Qwen ở backend nếu luồng chưa khả dụng.
           </p>
         </div>
       ) : (
@@ -767,38 +700,21 @@ export function PrivateWorkPanel({ model, actions }: PanelProps) {
               {model.privatePreview && (
                 <div className="private-work-preview">
                   <div className="section-heading">
-                    <h3>
-                      {model.privatePreview.stage === "jev"
-                        ? "Nội dung sẽ gửi tới TypeSafe / Jev"
-                        : "Nội dung sẽ gửi tới planner"}
-                    </h3>
+                    <h3>Nội dung sẽ gửi tới planner</h3>
                     <span>CHƯA GỬI</span>
                   </div>
                   <p className="private-work-boundary">
-                    {model.privatePreview.stage === "jev"
-                      ? "Planner đã trả kế hoạch. Jev và local worker chưa chạy. Kiểm tra toàn bộ payload tới TypeSafe bên dưới trước khi duyệt; review/reject không tự chạy nhánh tắt."
-                      : "Đây là nội dung public planner sẽ nhận. Ô dữ liệu riêng không được đưa vào bản gửi; hãy kiểm tra ô công khai trước khi duyệt."}
-                    {model.privatePreview.stage !== "jev" &&
-                      model.privatePreview.jev_enabled &&
-                      " Jev đang bật: sau khi có plan sẽ có lần duyệt TypeSafe riêng."}
+                    Đây là nội dung public planner sẽ nhận. Ô dữ liệu riêng
+                    không được đưa vào bản gửi; hãy kiểm tra ô công khai trước
+                    khi duyệt.
                   </p>
-                  <pre
-                    aria-label={
-                      model.privatePreview.stage === "jev"
-                        ? "Jev payload"
-                        : "Public planner payload"
-                    }
-                  >
+                  <pre aria-label="Public planner payload">
                     {model.privatePreview.public_body}
                   </pre>
                   <dl className="private-work-metadata">
                     <div>
                       <dt>Provider</dt>
-                      <dd>
-                        {model.privatePreview.stage === "jev"
-                          ? "TypeSafe / Jev"
-                          : providerName(model.privatePreview.provider)}
-                      </dd>
+                      <dd>{providerName(model.privatePreview.provider)}</dd>
                     </div>
                     <div>
                       <dt>Model</dt>
@@ -856,9 +772,7 @@ export function PrivateWorkPanel({ model, actions }: PanelProps) {
                       className="approve-btn"
                       onClick={() => void actions.sendPrivateWork()}
                     >
-                      {model.privatePreview.stage === "jev"
-                        ? "Duyệt gửi Jev và thực hiện"
-                        : "Duyệt và thực hiện"}
+                      Duyệt và thực hiện
                     </button>
                   </>
                 ) : (
@@ -928,11 +842,6 @@ export function PrivateWorkPanel({ model, actions }: PanelProps) {
                 <small>
                   {item.route} · {providerName(item.provider)} · {item.model}
                 </small>
-                {item.jev ? (
-                  <JevReport result={item.jev} />
-                ) : (
-                  <small>Không gọi Jev trong lượt này</small>
-                )}
                 {hasLedgerRevision && (
                   <small
                     className={`private-ledger-history-revision${

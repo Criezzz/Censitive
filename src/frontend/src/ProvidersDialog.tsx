@@ -43,48 +43,55 @@ export function ProvidersDialog(props: ProviderDialogProps) {
         </button>
       </div>
       <p className="connection-intro">
-        Chọn nơi trả lời chat. Kết nối tài khoản chưa gửi nội dung hội thoại.
+        OpenAI API là kết nối ưu tiên cho hội thoại mới. Chọn đích nhận rồi
+        duyệt từng bản gửi.
       </p>
       <div className="connection-layout">
         <div className="provider-options" aria-label="Nhà cung cấp">
-          {providers.map((p) => (
-            <button
-              key={p.id}
-              className={
-                selected === p.id
-                  ? "provider-option selected"
-                  : "provider-option"
-              }
-              aria-pressed={selected === p.id}
-              disabled={working}
-              onClick={() => selectChoice(p.id)}
-            >
-              <span className="provider-symbol">
-                {p.id === "local-demo"
-                  ? "◇"
-                  : p.id === "antigravity-google"
-                    ? "✦"
-                    : "⌘"}
-              </span>
-              <span>
-                <strong>{p.name}</strong>
-                <small>
+          {providers
+            .slice()
+            .sort(
+              (a, b) =>
+                Number(b.id === "openai-api") - Number(a.id === "openai-api"),
+            )
+            .map((p) => (
+              <button
+                key={p.id}
+                className={
+                  selected === p.id
+                    ? "provider-option selected"
+                    : "provider-option"
+                }
+                aria-pressed={selected === p.id}
+                disabled={working}
+                onClick={() => selectChoice(p.id)}
+              >
+                <span className="provider-symbol">
                   {p.id === "local-demo"
-                    ? "Không cần tài khoản"
-                    : p.id === "local-qwen"
-                      ? "Mô hình chạy trên máy"
-                      : p.id === "openai-api"
-                        ? "API key · cloud"
-                        : p.id === "antigravity-google"
-                          ? "Tài khoản Google · CLI"
-                          : "Tài khoản ChatGPT · cloud"}
-                </small>
-              </span>
-              {current === p.id && (
-                <span className="current-provider">Đang dùng</span>
-              )}
-            </button>
-          ))}
+                    ? "◇"
+                    : p.id === "antigravity-google"
+                      ? "✦"
+                      : "⌘"}
+                </span>
+                <span>
+                  <strong>{p.name}</strong>
+                  <small>
+                    {p.id === "local-demo"
+                      ? "Không cần tài khoản"
+                      : p.id === "local-qwen"
+                        ? "Mô hình chạy trên máy"
+                        : p.id === "openai-api"
+                          ? "API key · cloud"
+                          : p.id === "antigravity-google"
+                            ? "Tài khoản Google · CLI"
+                            : "Tài khoản ChatGPT · cloud"}
+                  </small>
+                </span>
+                {current === p.id && (
+                  <span className="current-provider">Đang dùng</span>
+                )}
+              </button>
+            ))}
         </div>
         {chosen && (
           <section className="connection-detail" aria-label="Chi tiết kết nối">
@@ -103,19 +110,40 @@ export function ProvidersDialog(props: ProviderDialogProps) {
             ) : chosen.id === "openai-api" ? (
               <>
                 <p>
-                  Gọi OpenAI trực tiếp bằng API key của backend, sau khi bạn
-                  duyệt nội dung đã che. Không dùng phiên đăng nhập
-                  ChatGPT/Codex.
+                  Gọi OpenAI trực tiếp sau khi bạn duyệt nội dung đã che. API
+                  key và model được cấu hình ở backend trên máy.
                 </p>
                 <p role="status">
-                  {chosen.status === "configured"
+                  {chosen.status === "configured" || chosen.status === "ready"
                     ? "Đã có cấu hình key và model. Chưa xác minh bằng lượt gọi thật."
-                    : "Chưa có cấu hình API hợp lệ. Đặt OPENAI_API_KEY và CENSITIVE_OPENAI_MODEL cho backend, rồi khởi động lại."}
+                    : (connectionMessages[chosen.code] ??
+                      "Chưa có cấu hình API hợp lệ. Đặt OPENAI_API_KEY và CENSITIVE_OPENAI_MODEL cho backend, rồi khởi động lại.")}
                 </p>
                 <p>
                   Key không được gửi tới trình duyệt. Quyền dùng model, hạn mức
                   và chi phí do tài khoản OpenAI API của bạn quyết định.
                 </p>
+                <details className="connection-help">
+                  <summary>Hướng dẫn cấu hình OpenAI API</summary>
+                  <ol>
+                    <li>
+                      Đặt <code>OPENAI_API_KEY</code> trong cấu hình backend
+                      trên máy.
+                    </li>
+                    <li>
+                      Đặt <code>CENSITIVE_OPENAI_MODEL</code> nếu cần chọn model
+                      khác model mặc định.
+                    </li>
+                    <li>
+                      Khởi động lại backend, mở lại hộp này rồi chọn “Dùng cho
+                      hội thoại này”.
+                    </li>
+                  </ol>
+                  <p>
+                    Không nhập API key vào ô chat. Đọc cấu hình chỉ xác nhận
+                    key/model có mặt; chưa gọi OpenAI để kiểm thử kết nối.
+                  </p>
+                </details>
               </>
             ) : chosen.id === "antigravity-google" ? (
               <AntigravityConnectionCard
@@ -213,9 +241,12 @@ export function ProvidersDialog(props: ProviderDialogProps) {
             <select
               id="provider-model"
               value={chosen.model}
+              disabled
               onChange={() => {}}
             >
-              <option>{chosen.model}</option>
+              <option value={chosen.model}>
+                {chosen.model || "Chưa cấu hình model"}
+              </option>
             </select>
             <small className="model-note">
               {chosen.id === "local-demo"

@@ -13,7 +13,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from privacy_gateway.adapters.fake_provider import FakeProvider
-from privacy_gateway.adapters.jev import JevGate
 from privacy_gateway.adapters.local_detector import SemanticDetector
 from privacy_gateway.adapters.provider import (
     Provider,
@@ -22,8 +21,6 @@ from privacy_gateway.adapters.provider import (
     serialize_request,
 )
 from privacy_gateway.application.private_work import (
-    JevGateBlocked,
-    JevPreviewReady,
     PreparedWork,
     PrivateWorkbench,
     PrivateWorker,
@@ -39,10 +36,15 @@ from privacy_gateway.application.session_records import (
     decode_record,
     session_record,
 )
-from privacy_gateway.domain.detection import Detection, credential_detections, detect
+from privacy_gateway.domain.detection import (
+    EMAIL,
+    Detection,
+    EmailReveal,
+    credential_detections,
+    detect,
+)
 from privacy_gateway.domain.formula_plan import (
     decode_formula_plan,
-    validate_formula_plan,
 )
 from privacy_gateway.domain.identity import (
     DraftIdentity,
@@ -52,7 +54,6 @@ from privacy_gateway.domain.identity import (
     verify_draft_identity,
 )
 from privacy_gateway.domain.incremental import Compilation, CompiledSource, compile_state
-from privacy_gateway.domain.jev import JevAssessment, formula_jev_body
 from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES, MAX_REQUEST_BYTES
 from privacy_gateway.domain.manual_facts import (
     CreateFact,
@@ -137,17 +138,9 @@ class Prepared:
     resolver_calls: int = 0
     resolver_full_fallback: bool = False
     review_plan: ReviewPlan | None = None
-    stage: str = "planner"
-    jev_gate: JevGate | None = field(default=None, repr=False)
-    jev_signature: tuple[str, str, str] | None = None
-    planner_body: bytes | None = field(default=None, repr=False)
-    formula_plan: dict[str, object] | None = field(default=None, repr=False)
-
-
-class ChatJevPreviewReady(Exception):
-    def __init__(self, prepared: Prepared) -> None:
-        self.prepared = prepared
-        super().__init__("JEV_PREVIEW_READY")
+    unmask_once: tuple[EmailReveal, ...] = ()
+    allowed_literals: tuple[str, ...] = field(default=(), repr=False)
+    masked_sanitized: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -176,7 +169,6 @@ class PrivateWork:
     trace: tuple[str, ...] = ()
     plan: dict[str, object] | None = field(default=None, repr=False)
     ledger_revision: int | None = None
-    jev: JevAssessment | None = None
 
 
 @dataclass(frozen=True)
@@ -226,7 +218,6 @@ class Session:
     private_selected_signature: tuple[str, str, str] | None = field(default=None, repr=False)
     private_prepared_ledger_revision: int | None = field(default=None, repr=False)
     private_ledger_candidate: PendingLedger | None = field(default=None, repr=False)
-    latest_jev: JevAssessment | None = None
 
     @property
     def busy(self) -> bool:
@@ -743,9 +734,7 @@ class Gateway:
                 ),
                 None,
             )
-            workbench = PrivateWorkbench(
-                workbench.planner, LedgerWorker(selected_ledger, base), workbench.gate
-            )
+            workbench = PrivateWorkbench(workbench.planner, LedgerWorker(selected_ledger, base))
             self._drop_private_preview(session)
             session.private_workbench = workbench
         else:
@@ -754,7 +743,6 @@ class Gateway:
         if len(session.private_work_history) >= 100:
             raise PrivacyError("PRIVATE_WORK_HISTORY_LIMIT")
         work = workbench.prepare(public_task, private_context)
-        session.latest_jev = None
         session.private_prepared = work
         session.private_prepared_version = session.version
         session.private_prepared_expires_at = time.monotonic() + 300
@@ -765,18 +753,6 @@ class Gateway:
         session.record("private_prepare", "ready")
         self._persist(session)
         return work
-
-    def _validate_jev_boundary(self, session: Session, body: bytes) -> None:
-        pending = [strict_json(body)]
-        while pending:
-            item = pending.pop()
-            if isinstance(item, str):
-                self._validate_public_private_boundary(session, item)
-            elif isinstance(item, dict):
-                pending.extend(item.keys())
-                pending.extend(item.values())
-            elif isinstance(item, list):
-                pending.extend(item)
 
     def private_work_preview(self, session: Session) -> PreparedWork:
         work = session.private_prepared
@@ -798,13 +774,7 @@ class Gateway:
             or (planner.provider_id, planner.model)
             != (session.provider.provider_id, session.provider.model)
             or session.private_workbench is None
-            or work.provider_signature != session.private_workbench._signature(work.stage)
-            or work.gate_signature
-            != (
-                session.private_workbench.gate.signature
-                if session.private_workbench.gate is not None
-                else None
-            )
+            or work.provider_signature != session.private_workbench._signature()
         ):
             self._drop_private_preview(session)
             raise PrivacyError("STALE_PREVIEW")
@@ -833,8 +803,6 @@ class Gateway:
             self._drop_private_preview(session)
             raise PrivacyError("PRIVATE_WORK_HISTORY_LIMIT")
         self._validate_public_private_boundary(session, work.public_task)
-        if work.stage == "jev":
-            self._validate_jev_boundary(session, work.body)
         if self.store is not None:
             try:
                 current_record_bytes = len(session_record(session).json_bytes())
@@ -895,11 +863,9 @@ class Gateway:
                 trace=result.trace,
                 plan=(getattr(result, "plan", None) if ledger_revision is not None else None),
                 ledger_revision=ledger_revision,
-                jev=result.jev,
             )
             PrivateWorkRecord.from_domain(entry)
             session.private_work_history.append(entry)
-            session.latest_jev = result.jev
             session.version += 1
             session.send_marker = None
             session.recovery_status = "none"
@@ -913,39 +879,6 @@ class Gateway:
                 session.recovery_status = "unknown_send"
                 raise
             return answer
-        except JevPreviewReady as pause:
-            next_work = pause.work
-            try:
-                if session.cancelled or session.closed:
-                    raise PrivacyError("CANCELLED")
-                self._validate_jev_boundary(session, next_work.body)
-                session.private_prepared = next_work
-                session.private_prepared_version = session.version
-                session.private_prepared_expires_at = time.monotonic() + 300
-                session.private_prepared_ledger_revision = ledger_revision
-                session.send_marker = None
-                session.recovery_status = "none"
-                session.record("private_plan", "jev_approval_required")
-                self._persist(session)
-            except Exception:
-                current.discard(next_work.id)
-                self._drop_private_preview(session)
-                session.send_marker = marker
-                session.recovery_status = "unknown_send"
-                raise
-            return ""
-        except JevGateBlocked as blocked:
-            session.latest_jev = blocked.assessment
-            session.send_marker = None
-            session.recovery_status = "none"
-            session.record("private_jev", blocked.assessment.decision)
-            try:
-                self._persist(session)
-            except PrivacyError:
-                session.send_marker = marker
-                session.recovery_status = "unknown_send"
-                raise
-            raise
         except asyncio.CancelledError:
             session.record("private_complete", "cancelled")
             raise PrivacyError("CANCELLED") from None
@@ -961,8 +894,6 @@ class Gateway:
         finally:
             session.active_id = None
             session.active_task = None
-            if work.stage == "jev":
-                session.latest_jev = current.latest_jev
             if session.closed:
                 session.audit.clear()
 
@@ -1182,6 +1113,7 @@ class Gateway:
         *,
         draft_identity: DraftIdentity | None = None,
         draft_facts: DraftFacts | None = None,
+        unmask_once: tuple[EmailReveal, ...] = (),
     ) -> Prepared:
         self._ensure_writable(session)
         if not session.provider_confirmed:
@@ -1198,7 +1130,7 @@ class Gateway:
             self.discard(session)
             raise PrivacyError("STATE_DISABLED")
         if self.detector is None and self.resolver is None:
-            return self.prepare(session, text, terms)
+            return self.reveal_emails(session, self.prepare(session, text, terms), unmask_once)
         if request_id in session.cancelled_prepares:
             raise PrivacyError("CANCELLED")
         self.discard(session)
@@ -1276,7 +1208,7 @@ class Gateway:
                     resolution.current_source,
                     draft_identity,
                 )
-            return self.prepare_stateful(
+            prepared = self.prepare_stateful(
                 session,
                 text,
                 terms,
@@ -1285,7 +1217,120 @@ class Gateway:
                 draft_identity=draft_identity,
                 draft_facts=draft_facts,
             )
-        return self.prepare(session, text, terms, report=report, request_id=attempt)
+        else:
+            prepared = self.prepare(session, text, terms, report=report, request_id=attempt)
+        return self.reveal_emails(session, prepared, unmask_once)
+
+    def _revealed_content(self, prepared: Prepared, masked: str, session: Session) -> str:
+        selected = {(item.start, item.end) for item in prepared.unmask_once}
+        if not selected or len(selected) != len(prepared.unmask_once) or len(selected) > 30:
+            raise PrivacyError("UNMASK_FORBIDDEN")
+        eligible = {
+            (d.start, d.end)
+            for d in prepared.detections
+            if d.category == "email" and d.restore_allowed
+        }
+        if not selected <= eligible:
+            raise PrivacyError("UNMASK_FORBIDDEN")
+        protected = (*session.terms, *prepared.literal_policies)
+        if prepared.semantic is not None:
+            protected += tuple(p.quote for p in prepared.semantic.protections)
+        denied = tuple(b.value for b in prepared.staged_vault.values() if not b.restore_allowed)
+        if prepared.staged_state is not None:
+            from privacy_gateway.domain.scoped import decisions
+
+            state = prepared.staged_state
+            denied += state.denied_literals
+            if any(
+                decision.targets and start < decision.span.end and decision.span.start < end
+                for decision in decisions(state, state.source(prepared.source_id), protected)
+                for start, end in selected
+            ):
+                raise PrivacyError("UNMASK_FORBIDDEN")
+        raw_obligations = (
+            *credential_detections(prepared.original),
+            *detect(prepared.original, protected, merge_overlaps=True),
+        )
+        for start, end in selected:
+            value = prepared.original[start:end]
+            if (
+                not EMAIL.fullmatch(value)
+                or any(secret and secret in value for secret in denied)
+                or any(
+                    d.start < end
+                    and start < d.end
+                    and (
+                        d.category != "email"
+                        or not d.restore_allowed
+                        or (d.start, d.end) != (start, end)
+                    )
+                    for d in raw_obligations
+                )
+                or any(term and term in value for term in protected)
+            ):
+                raise PrivacyError("UNMASK_FORBIDDEN")
+        if prepared.allowed_literals != tuple(
+            prepared.original[item.start : item.end] for item in prepared.unmask_once
+        ):
+            raise PrivacyError("UNMASK_FORBIDDEN")
+        pieces: list[str] = []
+        original_offset = masked_offset = 0
+        for detection in prepared.detections:
+            prefix = prepared.original[original_offset : detection.start]
+            if not masked.startswith(prefix, masked_offset):
+                raise PrivacyError("OUTBOUND_BLOCKED")
+            pieces.append(prefix)
+            masked_offset += len(prefix)
+            token = TOKEN.match(masked, masked_offset)
+            if token is None:
+                raise PrivacyError("OUTBOUND_BLOCKED")
+            binding = prepared.staged_vault.get(token[0])
+            value = prepared.original[detection.start : detection.end]
+            if binding is None or binding.value != value:
+                raise PrivacyError("OUTBOUND_BLOCKED")
+            pieces.append(value if (detection.start, detection.end) in selected else token[0])
+            masked_offset = token.end()
+            original_offset = detection.end
+        suffix = prepared.original[original_offset:]
+        if masked[masked_offset:] != suffix:
+            raise PrivacyError("OUTBOUND_BLOCKED")
+        return "".join((*pieces, suffix))
+
+    def reveal_emails(
+        self, session: Session, prepared: Prepared, selections: tuple[EmailReveal, ...]
+    ) -> Prepared:
+        if not selections:
+            return prepared
+        try:
+            if any(type(item) is not EmailReveal for item in selections):
+                raise PrivacyError("UNMASK_FORBIDDEN")
+            selections = tuple(EmailReveal.model_validate(vars(item)) for item in selections)
+            child = replace(
+                prepared,
+                unmask_once=selections,
+                allowed_literals=tuple(prepared.original[s.start : s.end] for s in selections),
+                masked_sanitized=prepared.sanitized,
+            )
+            content = self._revealed_content(child, prepared.sanitized, session)
+            messages = (
+                *prepared.expected_messages[:-1],
+                replace(prepared.expected_messages[-1], content=content),
+            )
+            body = serialize_request(
+                session.provider, [{"role": m.role, "content": m.content} for m in messages]
+            )
+            if len(body) > MAX_BODY:
+                raise PrivacyError("CONTEXT_LIMIT")
+            child = replace(child, sanitized=content, body=body, expected_messages=messages)
+            session.prepared = child
+            self._persist(session)
+            return child
+        except PrivacyError:
+            self.discard(session, prepared.id)
+            raise
+        except (ValueError, TypeError, AttributeError):
+            self.discard(session, prepared.id)
+            raise PrivacyError("UNMASK_FORBIDDEN") from None
 
     def correct_fact(
         self,
@@ -1757,19 +1802,6 @@ class Gateway:
         self._persist(session)
         return prepared
 
-    def bind_chat_gate(
-        self, session: Session, prepared: Prepared, gate: JevGate | None
-    ) -> Prepared:
-        if gate is not None:
-            if getattr(session.provider, "contract", "") != "chat":
-                self.discard(session)
-                raise PrivacyError("JEV_CHAT_UNSUPPORTED")
-            gate.require_key()
-        prepared = replace(prepared, jev_gate=gate, jev_signature=gate.signature if gate else None)
-        session.prepared = prepared
-        session.latest_jev = None
-        return prepared
-
     def gate(self, prepared: Prepared, session: Session) -> list[Message]:
         if prepared.provider_signature != (
             session.provider.provider_id,
@@ -1837,6 +1869,16 @@ class Gateway:
                 )
                 for m in prepared.expected_messages
             )
+        if prepared.unmask_once:
+            masked = prepared.masked_sanitized
+            if masked is None or (scoped and expected[-1].content != masked):
+                raise PrivacyError("OUTBOUND_BLOCKED")
+            revealed = self._revealed_content(prepared, masked, session)
+            if prepared.sanitized != revealed:
+                raise PrivacyError("OUTBOUND_BLOCKED")
+            expected = (*expected[:-1], replace(expected[-1], content=revealed))
+        elif prepared.allowed_literals or prepared.masked_sanitized is not None:
+            raise PrivacyError("OUTBOUND_BLOCKED")
         expected_payload = strict_json(
             serialize_request(
                 session.provider, [{"role": m.role, "content": m.content} for m in expected]
@@ -1851,7 +1893,7 @@ class Gateway:
         if payload["messages"] != expected_payload["messages"]:
             raise PrivacyError("OUTBOUND_BLOCKED")
         messages = []
-        for message in [{"role": m.role, "content": m.content} for m in expected]:
+        for index, message in enumerate([{"role": m.role, "content": m.content} for m in expected]):
             if (
                 not isinstance(message, dict)
                 or set(message) != {"role", "content"}
@@ -1862,10 +1904,16 @@ class Gateway:
                 raise PrivacyError("INVALID_PAYLOAD")
             content = message["content"]
             validate_tokens(content, prepared.manifest)
+            checked = (
+                prepared.masked_sanitized
+                if prepared.unmask_once and index == len(expected) - 1
+                else content
+            )
+            assert checked is not None
             literal_terms = prepared.literal_policies if scoped else session.terms
-            if detect(content, literal_terms, history=True):
+            if detect(checked, literal_terms, history=True):
                 raise PrivacyError("OUTBOUND_BLOCKED")
-            segments = TOKEN.split(content)
+            segments = TOKEN.split(checked)
             forbidden = (
                 prepared.staged_state.denied_literals
                 if prepared.staged_state is not None
@@ -1899,46 +1947,21 @@ class Gateway:
         if on_delta is not None and not isinstance(session.provider, StreamingProvider):
             raise PrivacyError("STREAM_UNSUPPORTED")
         session.prepared = None
-        if prepared.jev_gate is not None:
-            prepared.jev_gate.require_key()
-            if prepared.jev_signature != prepared.jev_gate.signature:
-                raise PrivacyError("STALE_PREVIEW")
-        planner_prepared = prepared
-        if prepared.stage == "jev":
-            if (
-                prepared.planner_body is None
-                or prepared.formula_plan is None
-                or prepared.jev_gate is None
-            ):
-                raise PrivacyError("STALE_PREVIEW")
-            planner_prepared = replace(prepared, body=prepared.planner_body)
-        messages = self.gate(planner_prepared, session)
-        if prepared.stage == "jev":
-            plan = validate_formula_plan(
-                prepared.formula_plan,
-                prepared.manifest,
-                [{"role": m.role, "content": m.content} for m in messages],
-            )
-            if prepared.body != formula_jev_body(prepared.sanitized, plan.raw, plan.aliases):
-                raise PrivacyError("STALE_PREVIEW")
+        messages = self.gate(prepared, session)
         session.active_id = prepared.id
         session.cancelled = False
         provider = session.provider
+        if prepared.unmask_once:
+            session.record("rule_unmasked_once", prepared.id)
         marker = None
         if self.store is not None:
             marker = SendMarkerRecord(
                 marker_id=secrets.token_hex(16),
                 prepared_id=prepared.id,
                 request_sha256=hashlib.sha256(prepared.body).hexdigest(),
-                provider_id=prepared.jev_signature[0]
-                if prepared.stage == "jev" and prepared.jev_signature
-                else provider.provider_id,
-                model=prepared.jev_signature[1]
-                if prepared.stage == "jev" and prepared.jev_signature
-                else provider.model,
-                serializer_version=prepared.jev_signature[2]
-                if prepared.stage == "jev" and prepared.jev_signature
-                else provider.serializer_version,
+                provider_id=provider.provider_id,
+                model=provider.model,
+                serializer_version=provider.serializer_version,
                 original=prepared.original,
             )
             session.send_marker = marker
@@ -1968,23 +1991,6 @@ class Gateway:
                 prepared.manifest,
                 [{"role": m.role, "content": m.content} for m in messages],
             )
-            if plan.formulas and prepared.jev_gate is not None and prepared.stage != "jev":
-                body = formula_jev_body(prepared.sanitized, plan.raw, plan.aliases)
-                template = TOKEN.sub("", plan.raw["answer_template"])
-                if detect(
-                    template, tuple(b.value for b in prepared.staged_vault.values()), history=True
-                ):
-                    raise PrivacyError("OUTBOUND_BLOCKED")
-                child = replace(
-                    prepared,
-                    id=secrets.token_hex(16),
-                    body=body,
-                    stage="jev",
-                    expires_at=time.monotonic() + 300,
-                    planner_body=prepared.body,
-                    formula_plan=plan.raw,
-                )
-                raise ChatJevPreviewReady(child)
             display = await execute_chat_final_answer(
                 plan,
                 self.private_worker,
@@ -2010,25 +2016,12 @@ class Gateway:
             metadata = ChatMetadata(
                 route="derived_formula" if plan.formulas else "ordinary",
                 public_plan=json.dumps(plan.raw, ensure_ascii=False, separators=(",", ":")),
-                local_execution="qwen"
-                if plan.formulas or TOKEN.search(plan.raw["answer_template"])
-                else "none",
+                local_execution="qwen" if plan.aliases or plan.formulas else "none",
                 derived_count=len(plan.formulas),
-                jev_status="not_applicable"
-                if not plan.formulas
-                else ("pass" if prepared.stage == "jev" else "off"),
-                jev=session.latest_jev if prepared.stage == "jev" else None,
             )
             return plan.raw["answer_template"], display, {}, metadata
 
         async def consume() -> tuple[str, str, dict[str, Binding], ChatMetadata | None]:
-            if prepared.stage == "jev":
-                assert prepared.jev_gate is not None
-                assessment = await prepared.jev_gate.assess(prepared.body)
-                session.latest_jev = assessment
-                if assessment.decision != "pass":
-                    raise JevGateBlocked(assessment)
-                return await finalize(json.dumps(prepared.formula_plan, ensure_ascii=False))
             if not isinstance(provider, StreamingProvider):
                 return await finalize(await provider.complete(prepared.body))
             restorer = IncrementalRestorer(prepared.manifest)
@@ -2091,33 +2084,6 @@ class Gateway:
                     session.version = previous_version
                     raise
             return display
-        except ChatJevPreviewReady as pause:
-            if session.cancelled or session.closed:
-                raise PrivacyError("CANCELLED") from None
-            session.prepared = pause.prepared
-            session.send_marker = None
-            session.recovery_status = "none"
-            session.record("chat_plan", "jev_approval_required")
-            try:
-                self._persist(session)
-            except PrivacyError:
-                session.prepared = None
-                session.send_marker = marker
-                session.recovery_status = "unknown_send"
-                raise
-            return ""
-        except JevGateBlocked as blocked:
-            session.latest_jev = blocked.assessment
-            session.send_marker = None
-            session.recovery_status = "none"
-            session.record("chat_jev", blocked.assessment.decision)
-            try:
-                self._persist(session)
-            except PrivacyError:
-                session.send_marker = marker
-                session.recovery_status = "unknown_send"
-                raise
-            raise
         except asyncio.CancelledError:
             session.record("complete", "cancelled")
             raise PrivacyError("CANCELLED") from None

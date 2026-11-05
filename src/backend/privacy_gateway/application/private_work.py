@@ -6,18 +6,17 @@ import json
 import re
 import secrets
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import Protocol
 
-from privacy_gateway.adapters.jev import JevGate
 from privacy_gateway.adapters.provider import Provider, ProviderOptions, serialize_request
 from privacy_gateway.domain.formula_plan import (
     FormulaPlan,
     formula_result_schema,
+    json_document_strings,
     validate_formula_values,
 )
-from privacy_gateway.domain.jev import JevAssessment, jev_body
 from privacy_gateway.domain.private_plan import (
     ComposePlan,
     ComputePlan,
@@ -155,6 +154,43 @@ async def execute_chat_formulas(
     return validate_formula_values(plan, raw)
 
 
+def _canonicalize_json_token_escapes(text: str, tokens: frozenset[str]) -> str:
+    for token in tokens:
+        pattern = "".join(f"(?:{re.escape(char)}|\\\\u(?i:{ord(char):04x}))" for char in token)
+        text = re.sub(pattern, token, text)
+    return text
+
+
+def validate_final_answer_output(answer: object, denied_literals: tuple[str, ...] = ()) -> str:
+    answer_strings = json_document_strings(answer) if isinstance(answer, str) else None
+    if (
+        not isinstance(answer, str)
+        or not answer.strip()
+        or len(answer) > 12_000
+        or len(answer.encode("utf-8")) > 48_000
+        or PREFIX in answer
+        or (answer_strings is not None and any(PREFIX in value for value in answer_strings))
+        or (
+            (answer_strings is None and ("{{" in answer or "}}" in answer))
+            or (
+                answer_strings is not None
+                and any("{{" in value or "}}" in value for value in answer_strings)
+            )
+        )
+    ):
+        raise PrivacyError("FINAL_ANSWER_INVALID")
+    if any(
+        value
+        and (
+            value in answer
+            or (answer_strings is not None and any(value in string for string in answer_strings))
+        )
+        for value in denied_literals
+    ):
+        raise PrivacyError("FINAL_ANSWER_FORBIDDEN")
+    return answer
+
+
 async def execute_chat_final_answer(
     plan: FormulaPlan,
     worker: PrivateWorker | None,
@@ -164,29 +200,51 @@ async def execute_chat_final_answer(
     denied_literals: tuple[str, ...] = (),
 ) -> str:
     draft: str = plan.raw["answer_template"]
-    referenced = set(TOKEN.findall(draft))
+    referenced = set(TOKEN.findall(draft)) | set(plan.template_tokens)
     visible = set(plan.aliases.values())
-    denied = (*denied_literals, *(b.value for b in manifest.values() if not b.restore_allowed))
-    if any(value and value in TOKEN.sub("", draft) for value in denied):
-        raise PrivacyError("FINAL_ANSWER_FORBIDDEN")
     if not referenced <= visible:
         raise PrivacyError("FORMULA_REFERENCE_INVALID")
-    if not referenced and not plan.formulas:
+    required = referenced | {plan.aliases[name] for name in plan.required_aliases}
+    visible_bindings: dict[str, Binding] = {}
+    for token in visible:
+        binding = manifest.get(token)
+        if binding is None:
+            continue
+        if binding.token != token:
+            raise PrivacyError("INVALID_BINDING")
+        visible_bindings[token] = binding
+    denied = (
+        *denied_literals,
+        *(binding.value for binding in manifest.values() if not binding.restore_allowed),
+    )
+    draft_strings = json_document_strings(draft)
+    if any(
+        value
+        and (
+            value in TOKEN.sub("", draft)
+            or (
+                draft_strings is not None
+                and any(value in TOKEN.sub("", string) for string in draft_strings)
+            )
+        )
+        for value in denied
+    ):
+        raise PrivacyError("FINAL_ANSWER_FORBIDDEN")
+    if not plan.aliases and not plan.formulas:
         return draft
     if worker is None:
         raise PrivacyError("FINAL_WORKER_UNAVAILABLE")
     local_request = user_request
     for value in sorted({value for value in denied if value}, key=len, reverse=True):
         local_request = local_request.replace(value, "[private value withheld]")
-    required = referenced | {plan.aliases[name] for name in plan.required_aliases}
     bindings: dict[str, object] = {}
     withheld: set[str] = set()
     for name, token in plan.aliases.items():
-        if token not in required:
+        binding = visible_bindings.get(token)
+        if binding is None:
+            if token in required:
+                raise PrivacyError("INVALID_BINDING")
             continue
-        binding = manifest.get(token)
-        if binding is None or binding.token != token:
-            raise PrivacyError("INVALID_BINDING")
         if binding.restore_allowed and not any(
             value and value in binding.value for value in denied
         ):
@@ -195,6 +253,7 @@ async def execute_chat_final_answer(
             withheld.add(token)
     if withheld & {plan.aliases[name] for name in plan.required_aliases}:
         raise PrivacyError("FORMULA_INPUT_FORBIDDEN")
+    draft = _canonicalize_json_token_escapes(draft, frozenset(referenced))
     draft = TOKEN.sub(
         lambda match: match[0] if match[0] not in withheld else "[private value withheld]",
         draft,
@@ -205,19 +264,7 @@ async def execute_chat_final_answer(
         json.dumps({"draft": draft, "formulas": plan.formulas}, ensure_ascii=False),
         "final_answer",
     )
-    if (
-        not isinstance(answer, str)
-        or not answer.strip()
-        or len(answer) > 12_000
-        or len(answer.encode("utf-8")) > 48_000
-        or PREFIX in answer
-        or "{{" in answer
-        or "}}" in answer
-    ):
-        raise PrivacyError("FINAL_ANSWER_INVALID")
-    if any(value and value in answer for value in denied):
-        raise PrivacyError("FINAL_ANSWER_FORBIDDEN")
-    return answer
+    return validate_final_answer_output(answer, denied)
 
 
 @dataclass(frozen=True)
@@ -227,24 +274,6 @@ class PreparedWork:
     private_context: str = field(repr=False)
     body: bytes
     provider_signature: tuple[str, str, str]
-    stage: Literal["planner", "jev"] = "planner"
-    gate_signature: tuple[str, str, str] | None = None
-    public_plan: dict[str, object] | None = field(default=None, repr=False)
-    planner_body_sha256: str = ""
-
-
-class JevPreviewReady(Exception):
-    def __init__(self, work: PreparedWork) -> None:
-        self.work = work
-        super().__init__("JEV_PREVIEW_READY")
-
-
-class JevGateBlocked(PrivacyError):
-    def __init__(self, assessment: JevAssessment) -> None:
-        self.assessment = assessment
-        super().__init__(
-            "JEV_REJECTED" if assessment.decision == "reject" else "JEV_REVIEW_REQUIRED"
-        )
 
 
 @dataclass(frozen=True)
@@ -254,7 +283,6 @@ class WorkResult:
     public_body_sha256: str
     plan: dict[str, object]
     trace: tuple[str, ...]
-    jev: JevAssessment | None = None
 
 
 def public_plan_body(provider: Provider, public_task: str) -> bytes:
@@ -277,8 +305,8 @@ def public_plan_body(provider: Provider, public_task: str) -> bytes:
             "Only scalar numeric inputs and copied text are supported in compute/compose. "
             "For compose use render.kind template only. Sign/conditional render and vector "
             "arithmetic are unsupported by this profile; do not propose them. For requests "
-            "requiring these operations use local_answer, which is explicitly unsupported "
-            "when Jev is enabled. Extraction must request only source facts, never calculate.\n"
+            "requiring these operations use local_answer, which runs locally. "
+            "Extraction must request only source facts, never calculate.\n"
             if getattr(provider, "qwen_formulas", False)
             else ""
         )
@@ -314,20 +342,12 @@ def decode_plan(answer: str) -> dict[str, object]:
 
 
 class PrivateWorkbench:
-    def __init__(
-        self, planner: Provider, worker: PrivateWorker, gate: JevGate | None = None
-    ) -> None:
+    def __init__(self, planner: Provider, worker: PrivateWorker) -> None:
         self.planner = planner
         self.worker = worker
-        self.gate = gate
-        self.latest_jev: JevAssessment | None = None
         self._pending: dict[str, PreparedWork] = {}
 
-    def _signature(self, stage: str = "planner") -> tuple[str, str, str]:
-        if stage == "jev":
-            if self.gate is None:
-                raise PrivacyError("JEV_KEY_REQUIRED")
-            return self.gate.signature
+    def _signature(self) -> tuple[str, str, str]:
         return (
             self.planner.provider_id,
             self.planner.model,
@@ -335,8 +355,6 @@ class PrivateWorkbench:
         )
 
     def prepare(self, public_task: str, private_context: str) -> PreparedWork:
-        if self.gate is not None:
-            self.gate.require_key()
         body = public_plan_body(self.planner, public_task)
         if not isinstance(private_context, str) or len(private_context) > 12000:
             raise PrivacyError("PRIVATE_CONTEXT_LIMIT")
@@ -352,7 +370,6 @@ class PrivateWorkbench:
             private_context,
             body,
             self._signature(),
-            gate_signature=self.gate.signature if self.gate is not None else None,
         )
         self._pending[work.id] = work
         return work
@@ -364,42 +381,8 @@ class PrivateWorkbench:
         work = self._pending.pop(work_id, None)
         if work is None:
             raise PrivacyError("PRIVATE_WORK_NOT_FOUND")
-        if (
-            work.provider_signature != self._signature(work.stage)
-            or approved_body != work.body
-            or work.gate_signature != (self.gate.signature if self.gate is not None else None)
-        ):
+        if work.provider_signature != self._signature() or approved_body != work.body:
             raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
-        if self.gate is not None:
-            self.gate.require_key()
-        if work.stage == "jev":
-            if self.gate is None or work.public_plan is None:
-                raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
-            if (
-                jev_body(
-                    work.public_task,
-                    work.public_plan,
-                    qwen_formulas=bool(getattr(self.planner, "qwen_formulas", False)),
-                )
-                != work.body
-            ):
-                raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
-            assessment = await self.gate.assess(work.body)
-            self.latest_jev = assessment
-            task = asyncio.current_task()
-            if task is not None and task.cancelling():
-                raise PrivacyError("CANCELLED")
-            if assessment.decision != "pass":
-                raise JevGateBlocked(assessment)
-            result = await execute_local_plan(
-                work.public_plan,
-                self.worker,
-                public_task=work.public_task,
-                private_context=work.private_context,
-                public_body_sha256=work.planner_body_sha256,
-                qwen_formulas=bool(getattr(self.planner, "qwen_formulas", False)),
-            )
-            return replace(result, jev=assessment, trace=(*result.trace, "jev_public_plan_pass"))
         if public_plan_body(self.planner, work.public_task) != work.body:
             raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
         try:
@@ -408,28 +391,6 @@ class PrivateWorkbench:
         except TimeoutError:
             raise PrivacyError("PRIVATE_PLANNER_TIMEOUT") from None
         raw = decode_plan(response)
-        if self.gate is not None:
-            body = jev_body(
-                work.public_task,
-                raw,
-                qwen_formulas=bool(getattr(self.planner, "qwen_formulas", False)),
-            )
-            validate_bound_plan = getattr(self.worker, "validate_plan", None)
-            if callable(validate_bound_plan):
-                validate_bound_plan(validate_plan(lower_planner_plan(raw)))
-            next_work = PreparedWork(
-                secrets.token_hex(16),
-                work.public_task,
-                work.private_context,
-                body,
-                self._signature("jev"),
-                stage="jev",
-                gate_signature=work.gate_signature,
-                public_plan=raw,
-                planner_body_sha256=hashlib.sha256(work.body).hexdigest(),
-            )
-            self._pending[next_work.id] = next_work
-            raise JevPreviewReady(next_work)
         return await execute_local_plan(
             raw,
             self.worker,

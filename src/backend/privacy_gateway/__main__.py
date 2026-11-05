@@ -28,7 +28,7 @@ def main() -> None:
         "--provider", choices=("demo", "codex", "openai", "local"), default="openai"
     )
     parser.add_argument("--detector", choices=("rules", "qwen"), default="rules")
-    parser.add_argument("--local-model", choices=("4b", "8b"), default="8b")
+    parser.add_argument("--local-model", choices=("1.7b", "4b", "8b"), default="8b")
     parser.add_argument("--semantic-mode", choices=("literal", "state"), default="literal")
     parser.add_argument(
         "--storage-dir",

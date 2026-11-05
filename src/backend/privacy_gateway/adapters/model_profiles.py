@@ -20,6 +20,16 @@ class ModelProfile:
 
 PROFILES = MappingProxyType(
     {
+        "1.7b": ModelProfile(
+            "1.7b",
+            "qwen3-1.7b-local",
+            "Qwen3-1.7B-Q4_K_M.gguf",
+            "d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5",
+            1_282_439_264,
+            "ggml-org/Qwen3-1.7B-GGUF",
+            "daeb8e2d528a760970442092f6bf1e55c3b659eb",
+            24,
+        ),
         "4b": ModelProfile(
             "4b",
             "qwen3-4b-local",

@@ -99,8 +99,18 @@ export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   provider?: string;
+  metadata?: ChatMetadata | null;
+};
+export type ChatMetadata = {
+  route: "derived_formula" | "ordinary";
+  public_plan: string;
+  local_execution: "qwen" | "none";
+  derived_count: number;
 };
 export type Preview = {
+  stage?: "planner";
+  provider?: string;
+  model?: string;
   streaming: boolean;
   state?: FactState | null;
   id: string;
@@ -136,6 +146,7 @@ export type Preview = {
     category: string;
     value: string;
     restore_allowed: boolean;
+    unmasked_once?: boolean;
   }[];
   review?: {
     expected_epoch: number;
@@ -149,6 +160,11 @@ export type Preview = {
       rejected: boolean;
     }[];
   } | null;
+};
+export type ChatSendResult = {
+  content?: string;
+  provider?: string;
+  metadata?: ChatMetadata | null;
 };
 export type PreviewDecision = {
   operation_id: string;
@@ -180,7 +196,6 @@ export type SessionView = {
   audit: { event: string; status: string; version: number }[];
   state?: FactState;
   private_work_available?: boolean;
-  latest_jev?: JevAssessment | null;
   private_work_history?: PrivateWorkRecord[];
   private_ledger_available?: boolean;
   private_ledger_model_available?: boolean;
@@ -194,15 +209,6 @@ export type InterruptedPrivateWork = {
 };
 export type Phase = "loading" | "idle" | "preparing" | "ready" | "sending";
 export type PrivateWorkPhase = "idle" | "preparing" | "ready" | "sending";
-export type JevAssessment = {
-  decision: "pass" | "review" | "reject";
-  model: string;
-  request_sha256: string;
-  input_tokens: number;
-  output_tokens: number;
-  latency_ms: number;
-  estimated_usd: string;
-};
 export type PrivateWorkRecord = {
   id: string;
   public_task: string;
@@ -214,7 +220,6 @@ export type PrivateWorkRecord = {
   model: string;
   trace: string[];
   ledger_revision?: number | null;
-  jev?: JevAssessment | null;
 };
 export type PrivateWorkPreview = {
   prepared_id: string;
@@ -224,8 +229,7 @@ export type PrivateWorkPreview = {
   provider: string;
   model: string;
   ledger_revision?: number | null;
-  stage?: "planner" | "jev";
-  jev_enabled?: boolean;
+  stage?: "planner";
 };
 export type LedgerEvidence = {
   quote: string;

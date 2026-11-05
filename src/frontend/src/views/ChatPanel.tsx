@@ -26,6 +26,7 @@ export function ChatPanel(props: PanelProps) {
     draftSelection,
     selectionIssue,
     selectionNotice,
+    selectionUndoAvailable,
     busy,
   } = props.model;
   const {
@@ -34,6 +35,7 @@ export function ChatPanel(props: PanelProps) {
     clearError,
     selectDraft,
     protectSelection,
+    undoSelection,
     changeDraft,
     prepare,
     cancelPrepare,
@@ -87,6 +89,12 @@ export function ChatPanel(props: PanelProps) {
                 ? "Qwen đọc ngữ cảnh ngay trên máy để đề xuất che thông tin nhạy cảm. Bạn xem lại bản gửi trước khi provider trả lời."
                 : "Nhập yêu cầu, chọn thông tin cần giữ riêng và kiểm tra bản chuẩn bị gửi."}
             </p>
+            {provider === "openai-api" && (
+              <p>
+                Khi cần tính từ giá trị đã che, OpenAI lập công thức và Qwen
+                thực hiện số học cuối tại máy.
+              </p>
+            )}
             {semantic && (
               <button
                 className="semantic-example"
@@ -133,6 +141,25 @@ export function ChatPanel(props: PanelProps) {
                     )}
                   </div>
                   <div className="message-text">{message.content}</div>
+                  {message.role === "assistant" && message.metadata && (
+                    <>
+                      <small className="chat-execution">
+                        {message.metadata.local_execution === "qwen"
+                          ? `Qwen local đã thực hiện ${message.metadata.derived_count} công thức · phục hồi tại máy`
+                          : "Phục hồi tại máy · không có bước tính Qwen"}
+                      </small>
+                      {message.metadata.public_plan && (
+                        <details className="chat-plan">
+                          <summary>Xem kế hoạch công khai</summary>
+                          <pre>{message.metadata.public_plan}</pre>
+                          <p>
+                            Kiểm hợp đồng và phục hồi không chứng minh công thức
+                            hoặc số học đúng.
+                          </p>
+                        </details>
+                      )}
+                    </>
+                  )}
                 </div>
               </article>
             ))}
@@ -162,7 +189,7 @@ export function ChatPanel(props: PanelProps) {
             {cancelPending
               ? "Đang hủy lượt…"
               : cloud
-                ? `${providerName(provider)} đang soạn phản hồi…`
+                ? `${providerName(provider)} đang xử lý; Qwen tính local nếu có công thức…`
                 : localModel
                   ? "Qwen local đang soạn phản hồi…"
                   : "Provider demo đang soạn phản hồi…"}
@@ -244,7 +271,12 @@ export function ChatPanel(props: PanelProps) {
           )}
           {selectionNotice && (
             <p className="selection-notice" role="status">
-              {selectionNotice}
+              {selectionNotice}{" "}
+              {selectionUndoAvailable && (
+                <button type="button" disabled={busy} onClick={undoSelection}>
+                  Hoàn tác
+                </button>
+              )}
             </p>
           )}
           <div className="composer-toolbar">

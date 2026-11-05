@@ -12,7 +12,11 @@ export function PrivacyPanel(props: PanelProps) {
     phase,
     preview,
     semantic,
-    terms,
+    draftTerms,
+    appliedTerms,
+    termInput,
+    termStatus,
+    legend,
     inspect,
     factsConfirmed,
     identityConfirmed,
@@ -22,7 +26,24 @@ export function PrivacyPanel(props: PanelProps) {
     privatePhase,
     busy,
   } = props.model;
-  const { changeTerms, setInspect, reviewPreview, send } = props.actions;
+  const {
+    changeTermInput,
+    addTerm,
+    removeTerm,
+    setInspect,
+    reviewPreview,
+    revealEmail,
+    send,
+  } = props.actions;
+  const categoryLabels: Record<string, string> = {
+    manual: "Cụm thủ công",
+    email: "Email",
+    personal: "Thông tin cá nhân",
+    health: "Sức khỏe",
+    financial: "Tài chính",
+    credential: "Thông tin truy cập",
+    confidential: "Thông tin nội bộ",
+  };
   const policyLocked = busy;
   return (
     <aside
@@ -78,16 +99,46 @@ export function PrivacyPanel(props: PanelProps) {
         <label htmlFor="protected-terms">
           Cụm cần bảo vệ <span>Bổ sung</span>
         </label>
-        <textarea
-          id="protected-terms"
-          name="protected-terms"
-          autoComplete="off"
-          value={terms}
-          maxLength={6030}
-          disabled={policyLocked}
-          onChange={(e) => changeTerms(e.target.value)}
-          placeholder={"Mỗi dòng một cụm, ví dụ:\nLan\nMaple"}
-        />
+        <ul className="protected-terms" aria-label="Danh sách cụm bảo vệ">
+          {[...appliedTerms, ...draftTerms].map((term) => (
+            <li className="term-chip" key={term}>
+              <span>{term}</span>
+              {appliedTerms.includes(term) ? (
+                <small>Đã áp dụng trong phiên · vẫn được che</small>
+              ) : (
+                <button
+                  type="button"
+                  aria-label={`Bỏ cụm “${term}”`}
+                  disabled={policyLocked}
+                  onClick={() => removeTerm(term)}
+                >
+                  Bỏ
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+        <form
+          className="term-entry"
+          onSubmit={(event) => {
+            event.preventDefault();
+            addTerm();
+          }}
+        >
+          <input
+            id="protected-terms"
+            name="protected-terms"
+            autoComplete="off"
+            value={termInput}
+            disabled={policyLocked}
+            onChange={(event) => changeTermInput(event.target.value)}
+            placeholder="Nhập một cụm"
+          />
+          <button type="submit" disabled={policyLocked}>
+            Thêm
+          </button>
+        </form>
+        {termStatus && <p role="status">{termStatus}</p>}
         <p>
           {semantic
             ? "Không bắt buộc. Thêm thông tin bạn muốn giữ riêng ngoài đề xuất của model. Quy tắc đã duyệt tiếp tục được giữ trong phiên."
@@ -98,7 +149,9 @@ export function PrivacyPanel(props: PanelProps) {
         <div className="section-heading">
           <h3>Bản chuẩn bị gửi</h3>
           <span>
-            {preview ? `${preview.detections.length} vùng đã che` : "CHƯA GỬI"}
+            {preview
+              ? `${preview.detections.filter((d) => !d.unmasked_once).length} vùng đã che`
+              : "CHƯA GỬI"}
           </span>
         </div>
         {preview ? (
@@ -140,8 +193,22 @@ export function PrivacyPanel(props: PanelProps) {
               <pre className="preview-content" aria-label="Bản chuẩn bị gửi">
                 {inspect === "preview"
                   ? preview.sanitized
+                      .split(/(\[\[PG_v1_[0-9a-f]{32}\]\])/g)
+                      .map((part, index) =>
+                        /^\[\[PG_v1_[0-9a-f]{32}\]\]$/.test(part) ? (
+                          <mark key={index}>{part}</mark>
+                        ) : (
+                          part
+                        ),
+                      )
                   : JSON.stringify(JSON.parse(preview.body), null, 2)}
               </pre>
+            )}
+            {preview.stage === "planner" && provider === "openai-api" && (
+              <p className="preview-detail">
+                OpenAI trả lời trên nội dung được duyệt và có thể lập công thức
+                trên biến. Qwen tính giá trị dẫn xuất tại máy khi có công thức.
+              </p>
             )}
             {inspect !== "evidence" && (
               <p className="preview-detail">
@@ -200,26 +267,104 @@ export function PrivacyPanel(props: PanelProps) {
                 )}
               </details>
             )}
-            {preview.detections.length > 0 && (
-              <div className="detections">
-                <h4>Giá trị giữ tại máy</h4>
-                {preview.detections.map((d, i) => (
-                  <div className="detection" key={i}>
-                    <span>
-                      {d.category === "email"
-                        ? "@"
-                        : d.category === "manual"
-                          ? "◇"
-                          : "⌘"}
-                    </span>
-                    <code>{d.value}</code>
-                    <small>
-                      {d.restore_allowed ? "Che" : "Không phục hồi"}
-                    </small>
-                  </div>
-                ))}
-              </div>
+            {preview.detections.some(
+              (d) => d.category === "email" && d.restore_allowed,
+            ) && (
+              <section
+                className="detections"
+                aria-label="Email cho lần gửi này"
+              >
+                <h4>Email cho lần gửi này</h4>
+                {preview.detections
+                  .filter((d) => d.category === "email" && d.restore_allowed)
+                  .map((d) => (
+                    <div className="detection" key={`${d.start}:${d.end}`}>
+                      <code>{d.value}</code>
+                      {d.unmasked_once ? (
+                        <strong role="status">
+                          Sẽ gửi lộ lần này · lượt sau che lại
+                        </strong>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={
+                            policyLocked ||
+                            [...appliedTerms, ...draftTerms].some((term) =>
+                              d.value.includes(term),
+                            )
+                          }
+                          onClick={() => void revealEmail(d.start, d.end)}
+                        >
+                          Gửi lộ lần này
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                <p>
+                  Lựa chọn chỉ áp dụng cho bản gửi đang duyệt, không thay đổi
+                  chính sách bảo vệ.
+                </p>
+              </section>
             )}
+            {preview.detections.some((d) => !d.unmasked_once) &&
+              (!legend || inspect === "preview") && (
+                <section
+                  className="detections"
+                  aria-label={
+                    legend
+                      ? "Chỉ hiển thị trên máy — không gửi"
+                      : "Giá trị giữ tại máy"
+                  }
+                >
+                  <h4>
+                    {legend
+                      ? "Chỉ hiển thị trên máy — không gửi"
+                      : "Giá trị giữ tại máy"}
+                  </h4>
+                  {(
+                    legend ?? preview.detections.filter((d) => !d.unmasked_once)
+                  ).map((d, i) => (
+                    <div className="detection" key={i}>
+                      {"token" in d && (
+                        <code className="legend-token" title={d.token}>
+                          {d.token.slice(8, 14)}…{d.token.slice(-6, -2)} →
+                        </code>
+                      )}
+                      <code>{d.value}</code>
+                      {"count" in d && d.count > 1 && <span>× {d.count}</span>}
+                      <small>
+                        {categoryLabels[d.category] ?? d.category} ·{" "}
+                        {d.restore_allowed
+                          ? "phục hồi tại máy"
+                          : "không phục hồi"}
+                      </small>
+                      {d.category === "manual" &&
+                      d.restore_allowed &&
+                      draftTerms.includes(d.value) &&
+                      !appliedTerms.includes(d.value) ? (
+                        <button
+                          type="button"
+                          disabled={policyLocked}
+                          onClick={() => removeTerm(d.value)}
+                        >
+                          Bỏ cụm này
+                        </button>
+                      ) : appliedTerms.includes(d.value) ||
+                        !preview.semantic ||
+                        d.category === "manual" ||
+                        d.category === "email" ||
+                        d.category === "credential" ||
+                        !d.restore_allowed ? (
+                        <small>
+                          {appliedTerms.includes(d.value)
+                            ? "Đã áp dụng trong phiên"
+                            : "Quy tắc bắt buộc"}
+                        </small>
+                      ) : null}
+                    </div>
+                  ))}
+                </section>
+              )}
             {preview.review && preview.review.items.length > 0 && (
               <details className="preview-decisions" open>
                 <summary>Điều chỉnh đề xuất mới</summary>

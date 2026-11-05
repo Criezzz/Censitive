@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type {
-  JevAssessment,
   ChatMessage,
+  ChatSendResult,
   Preview,
   PreviewDecision,
   PreviewDecisionResult,
@@ -35,6 +35,8 @@ import {
   identityErrors,
 } from "../data/errors";
 import type { Sample } from "../data/samples";
+import { termIssue } from "../data/protectedTerms";
+import { previewLegend } from "../data/previewLegend";
 import { selectedOccurrence } from "../data/occurrences";
 import { api, setCsrf, sendStream } from "../network/api";
 import { readStream } from "../stream";
@@ -49,6 +51,7 @@ const ACTIVE_SESSION_HINT_KEY = "censitive.active_session";
 
 function validPrivatePreview(value: PrivateWorkPreview): boolean {
   return (
+    (value.stage === undefined || value.stage === "planner") &&
     typeof value.prepared_id === "string" &&
     typeof value.public_body === "string" &&
     typeof value.public_body_sha256 === "string" &&
@@ -120,6 +123,13 @@ export function useChatController() {
   const streamCancellation = useRef<Promise<unknown> | null>(null);
   const [draft, setDraft] = useState("");
   const [terms, setTerms] = useState("");
+  const [appliedTerms, setAppliedTerms] = useState<string[]>([]);
+  const [termInput, setTermInput] = useState("");
+  const [termStatus, setTermStatus] = useState("");
+  const [selectionUndo, setSelectionUndo] = useState<
+    { term: string } | { mark: DraftFact } | null
+  >(null);
+  const [preparedText, setPreparedText] = useState("");
   const [phase, setPhase] = useState<Phase>("loading");
   const [preview, setPreview] = useState<Preview | null>(null);
   const [pendingReview, setPendingReview] = useState<PreviewDecision | null>(
@@ -133,12 +143,6 @@ export function useChatController() {
   const [showAudit, setShowAudit] = useState(false);
   const [cancelPending, setCancelPending] = useState(false);
   const [privateWorkAvailable, setPrivateWorkAvailable] = useState(false);
-  const [jevEnabled, setJevEnabled] = useState(false);
-  const [jevConfigured, setJevConfigured] = useState(false);
-  const [jevKeyOpen, setJevKeyOpen] = useState(false);
-  const [jevKey, setJevKey] = useState("");
-  const [jevKeyBusy, setJevKeyBusy] = useState(false);
-  const [latestJev, setLatestJev] = useState<JevAssessment | null>(null);
   const [privateWorkHistory, setPrivateWorkHistory] = useState<
     PrivateWorkRecord[]
   >([]);
@@ -179,7 +183,6 @@ export function useChatController() {
   const input = useRef<HTMLTextAreaElement>(null);
   const providerButton = useRef<HTMLButtonElement>(null);
   const chatBusy =
-    jevKeyBusy ||
     cancelPending ||
     phase === "preparing" ||
     phase === "sending" ||
@@ -215,13 +218,13 @@ export function useChatController() {
     setRecoveryStatus(state.recovery_status ?? null);
     setInterruptedTurn(state.interrupted_turn ?? null);
     setInterruptedPrivateWork(state.interrupted_private_work ?? null);
+    setAppliedTerms(Array.isArray(state.terms) ? state.terms : []);
     if (restoreDraftState && Array.isArray(state.terms))
       setTerms(state.terms.join("\n"));
     setMessages(state.messages);
     setAudit(state.audit);
     setFactState(state.state ?? null);
     setPrivateWorkAvailable(state.private_work_available === true);
-    setLatestJev(state.latest_jev ?? null);
     setPrivateWorkHistory(
       Array.isArray(state.private_work_history)
         ? state.private_work_history
@@ -325,12 +328,11 @@ export function useChatController() {
     return items[0] ?? null;
   }
   function clearConversationDraft() {
-    setJevEnabled(false);
-    setJevKey("");
-    setJevKeyOpen(false);
-    setLatestJev(null);
     setDraft("");
     setTerms("");
+    setAppliedTerms([]);
+    setTermInput("");
+    setTermStatus("");
     setPreview(null);
     setPendingReview(null);
     setProvisional(null);
@@ -395,6 +397,7 @@ export function useChatController() {
     setDraftFacts([]);
     setDraftSelection(null);
     setSelectionNotice("");
+    setSelectionUndo(null);
   }, [factState?.epoch, session, provider]);
 
   function clearDraftIdentity() {
@@ -402,6 +405,7 @@ export function useChatController() {
     setDraftFacts([]);
     setDraftSelection(null);
     setSelectionNotice("");
+    setSelectionUndo(null);
   }
   function invalidate(clearIdentity = true) {
     if (clearIdentity) clearDraftIdentity();
@@ -452,11 +456,11 @@ export function useChatController() {
       setPhase("idle");
     }
   }
-  async function prepare() {
+  async function prepare(unmaskOnce: { start: number; end: number }[] = []) {
     if (
       !draft.trim() ||
       !session ||
-      phase !== "idle" ||
+      (phase !== "idle" && !(phase === "ready" && unmaskOnce.length)) ||
       busy ||
       !providerConfirmed ||
       !factsConfirmed ||
@@ -512,9 +516,13 @@ export function useChatController() {
             .filter(Boolean),
           ...(draftIdentity ? { draft_identity: draftIdentity } : {}),
           ...(draftFactInput ? { draft_facts: draftFactInput } : {}),
+          ...(unmaskOnce.length ? { unmask_once: unmaskOnce } : {}),
         },
       );
       if (attempt !== generation.current) return;
+      if (result.stage !== undefined && result.stage !== "planner")
+        throw new Error("PREVIEW_OUTCOME_UNKNOWN");
+      setPreparedText(text);
       setPreview(result);
       setInspect("preview");
       setPhase("ready");
@@ -524,6 +532,28 @@ export function useChatController() {
         setPhase("idle");
       }
     }
+  }
+  async function revealEmail(start: number, end: number) {
+    if (!preview || phase !== "ready" || busy) return;
+    const detection = preview.detections.find(
+      (item) => item.start === start && item.end === end,
+    );
+    if (
+      !detection ||
+      detection.category !== "email" ||
+      !detection.restore_allowed ||
+      detection.unmasked_once ||
+      !window.confirm(
+        `Gửi lộ email “${detection.value}” cho đúng một lần gửi? Bản xem trước sẽ được chuẩn bị lại; bạn vẫn phải duyệt trước khi gửi. Lượt sau email được che lại.`,
+      )
+    )
+      return;
+    await prepare([
+      ...preview.detections
+        .filter((item) => item.unmasked_once)
+        .map((item) => ({ start: item.start, end: item.end })),
+      { start, end },
+    ]);
   }
   function explainPrivate(reason: unknown) {
     const code = reason instanceof Error ? reason.message : "REQUEST_FAILED";
@@ -817,64 +847,6 @@ export function useChatController() {
     setPrivateLedgerError("");
     setPrivateLedgerNotice("");
   }
-  async function toggleJev() {
-    if (busy) return;
-    if (privatePreview) invalidatePrivatePreview();
-    if (jevEnabled) {
-      setJevEnabled(false);
-      return;
-    }
-    if (jevConfigured) {
-      setJevEnabled(true);
-      return;
-    }
-    setJevKeyBusy(true);
-    setPrivateError("");
-    try {
-      const status = await api<{ configured: boolean }>("/jev");
-      setJevConfigured(status.configured === true);
-      setJevEnabled(status.configured === true);
-      setJevKeyOpen(status.configured !== true);
-    } catch (reason) {
-      explainPrivate(reason);
-    } finally {
-      setJevKeyBusy(false);
-    }
-  }
-  async function saveJevKey() {
-    if (busy || !jevKey.trim()) return;
-    const key = jevKey.trim();
-    setJevKey("");
-    setJevKeyBusy(true);
-    setPrivateError("");
-    try {
-      await api("/jev", "POST", { key });
-      setJevConfigured(true);
-      setJevEnabled(true);
-      setJevKeyOpen(false);
-      if (privatePreview) invalidatePrivatePreview();
-    } catch (reason) {
-      explainPrivate(reason);
-    } finally {
-      setJevKeyBusy(false);
-    }
-  }
-  async function removeJevKey() {
-    if (busy) return;
-    setJevKeyBusy(true);
-    setPrivateError("");
-    try {
-      await api("/jev", "DELETE");
-      setJevConfigured(false);
-      setJevEnabled(false);
-      setJevKey("");
-      if (privatePreview) invalidatePrivatePreview();
-    } catch (reason) {
-      explainPrivate(reason);
-    } finally {
-      setJevKeyBusy(false);
-    }
-  }
   async function preparePrivateWork() {
     const ledgerRevision = latestPrivateLedgerRevision();
     const useLedger =
@@ -909,7 +881,6 @@ export function useChatController() {
     const publicTask = privatePublicTask;
     const context = privateContext;
     setPrivateError("");
-    setLatestJev(null);
     setPrivatePreview(null);
     setPrivatePhase("preparing");
     try {
@@ -919,7 +890,6 @@ export function useChatController() {
         {
           public_task: publicTask,
           private_context: useLedger ? "" : context,
-          jev_enabled: jevEnabled,
           ...(ledgerRevisionId !== undefined
             ? { ledger_revision: ledgerRevisionId }
             : {}),
@@ -962,34 +932,13 @@ export function useChatController() {
     setPrivateError("");
     setPrivateCancelPending(false);
     setPrivatePhase("sending");
-    let awaitingJev = false;
     try {
       const result = await api<{
         answer?: string;
-        jev_preview?: PrivateWorkPreview;
       }>(`/sessions/${sessionId}/private-work/send`, "POST", {
         prepared_id: prepared.prepared_id,
       });
-      if (result.jev_preview) {
-        const next = result.jev_preview;
-        if (
-          next.stage !== "jev" ||
-          next.provider !== "typesafe-jev" ||
-          !validPrivatePreview(next)
-        )
-          throw new Error("PRIVATE_WORK_OUTCOME_UNKNOWN");
-        if (attempt !== generation.current || sessionId !== session) {
-          await discardPrivatePreview(sessionId, next.prepared_id).catch(
-            explainPrivate,
-          );
-          return;
-        }
-        setPrivatePreview(next);
-        setPrivatePhase("ready");
-        awaitingJev = true;
-        return;
-      }
-      if (typeof result.answer !== "string")
+      if ("jev_preview" in result || typeof result.answer !== "string")
         throw new Error("PRIVATE_WORK_OUTCOME_UNKNOWN");
       if (attempt !== generation.current || sessionId !== session) return;
       await refresh(sessionId, false, attempt);
@@ -1010,10 +959,8 @@ export function useChatController() {
       }
     } finally {
       if (attempt === generation.current && sessionId === session) {
-        if (!awaitingJev) {
-          setPrivatePreview(null);
-          setPrivatePhase("idle");
-        }
+        setPrivatePreview(null);
+        setPrivatePhase("idle");
         setPrivateCancelPending(false);
       }
     }
@@ -1168,6 +1115,8 @@ export function useChatController() {
       if (result.preview_available) {
         if (
           !result.preview ||
+          (result.preview.stage !== undefined &&
+            result.preview.stage !== "planner") ||
           result.preview.id !== receipt.new_prepared_id ||
           typeof result.preview.body !== "string"
         )
@@ -1249,9 +1198,15 @@ export function useChatController() {
           throw new Error("CANCELLED");
         }
       } else {
-        await api(`/sessions/${session}/send`, "POST", {
-          prepared_id: preview.id,
-        });
+        const result = await api<ChatSendResult>(
+          `/sessions/${session}/send`,
+          "POST",
+          {
+            prepared_id: preview.id,
+          },
+        );
+        if ("jev_preview" in result || typeof result.content !== "string")
+          throw new Error("PREVIEW_OUTCOME_UNKNOWN");
       }
       await refresh(session);
       setDraft("");
@@ -1273,9 +1228,9 @@ export function useChatController() {
       controller?.abort();
       activeStream.current = null;
       setProvisional(null);
+      setCancelPending(false);
       setPreview(null);
       setPhase("idle");
-      setCancelPending(false);
       clearDraftIdentity();
       input.current?.focus();
     }
@@ -1612,12 +1567,44 @@ export function useChatController() {
   function selectDraft(start: number, end: number) {
     setDraftSelection(selectedOccurrence(draft, start, end));
     setSelectionNotice("");
+    setSelectionUndo(null);
   }
   const selectedTerm = draftSelection?.quote.trim() ?? "";
   const currentTerms = terms
     .split("\n")
     .map((term) => term.trim())
     .filter(Boolean);
+  const draftTerms = currentTerms.filter(
+    (term) => !appliedTerms.includes(term),
+  );
+  const protectionTerms = [...new Set([...appliedTerms, ...currentTerms])];
+  function addTerm() {
+    if (busy) return;
+    const issue = termIssue(termInput, protectionTerms);
+    if (issue) {
+      setTermStatus(issue);
+      return;
+    }
+    changeTerms([...currentTerms, termInput.trim()].join("\n"));
+    setTermInput("");
+    setTermStatus("Đã thêm cụm bảo vệ.");
+  }
+  function removeTerm(term: string) {
+    if (busy || appliedTerms.includes(term) || !draftTerms.includes(term))
+      return;
+    changeTerms(currentTerms.filter((value) => value !== term).join("\n"));
+    setTermStatus("Đã bỏ cụm. Chuẩn bị lại bản gửi.");
+  }
+  function undoSelection() {
+    if (busy || !selectionUndo) return;
+    if ("term" in selectionUndo) removeTerm(selectionUndo.term);
+    else if (draftFacts.includes(selectionUndo.mark)) {
+      invalidate(false);
+      setDraftFacts(draftFacts.filter((mark) => mark !== selectionUndo.mark));
+    }
+    setSelectionNotice("");
+    setSelectionUndo(null);
+  }
   let selectionIssue = "";
   if (draftSelection) {
     if (factState?.enabled) {
@@ -1633,18 +1620,7 @@ export function useChatController() {
       else if (draftFacts.length >= 16)
         selectionIssue =
           "Đã đủ 16 đoạn đánh dấu. Hãy chuẩn bị bản gửi hoặc xóa các đánh dấu nháp.";
-    } else if (/[\r\n]/.test(draftSelection.quote))
-      selectionIssue =
-        "Chọn một cụm trên cùng một dòng để bảo vệ bằng khớp chính xác.";
-    else if (Array.from(selectedTerm).length > 200)
-      selectionIssue = "Chọn cụm không quá 200 ký tự.";
-    else if (selectedTerm.includes("[[PG_"))
-      selectionIssue = "Đoạn chọn chứa ký hiệu dành riêng của ứng dụng.";
-    else if (currentTerms.includes(selectedTerm))
-      selectionIssue = "Cụm này đã có trong danh sách bảo vệ.";
-    else if (currentTerms.length >= 30)
-      selectionIssue =
-        "Đã đủ 30 cụm bảo vệ. Hãy kiểm tra danh sách trước khi thêm.";
+    } else selectionIssue = termIssue(draftSelection.quote, protectionTerms);
   }
   function protectSelection() {
     if (
@@ -1665,13 +1641,18 @@ export function useChatController() {
     )
       return;
     if (factState?.enabled) {
-      stageFact({ occurrence: draftSelection, category: "confidential" });
+      const mark: DraftFact = {
+        occurrence: draftSelection,
+        category: "confidential",
+      };
+      stageFact(mark);
+      setSelectionUndo({ mark });
       setSelectionNotice(
         "Đã đánh dấu đoạn trong bản nháp. Chuẩn bị rồi duyệt bản gửi để áp dụng.",
       );
     } else {
-      invalidate();
-      setTerms([...currentTerms, selectedTerm].join("\n"));
+      changeTerms([...currentTerms, selectedTerm].join("\n"));
+      setSelectionUndo({ term: selectedTerm });
       setSelectionNotice(
         "Đã thêm cụm vào danh sách. Chuẩn bị lại và kiểm tra mọi lần khớp trước khi duyệt.",
       );
@@ -1717,10 +1698,18 @@ export function useChatController() {
       draftSelection,
       selectionIssue,
       selectionNotice,
+      selectionUndoAvailable: selectionUndo !== null,
       messages,
       provisional,
       draft,
       terms,
+      draftTerms,
+      appliedTerms,
+      termInput,
+      termStatus,
+      legend: preview
+        ? previewLegend(preview.sanitized, preview.detections, preparedText)
+        : null,
       phase,
       preview,
       pendingReview,
@@ -1731,12 +1720,6 @@ export function useChatController() {
       cancelPending,
       busy,
       privateWorkAvailable,
-      jevEnabled,
-      jevConfigured,
-      jevKeyOpen,
-      jevKey,
-      jevKeyBusy,
-      latestJev,
       privateWorkHistory,
       privatePublicTask,
       privateContext,
@@ -1759,20 +1742,9 @@ export function useChatController() {
       privateLedgerRerunPending,
     },
     actions: {
-      toggleJev,
-      saveJevKey,
-      removeJevKey,
-      changeJevKey: (key: string) => {
-        if (!busy) setJevKey(key);
-      },
-      closeJevKey: () => {
-        if (!busy) {
-          setJevKeyOpen(false);
-          setJevKey("");
-        }
-      },
       selectProvider,
       prepare,
+      revealEmail,
       reviewPreview,
       send,
       cancel,
@@ -1785,6 +1757,15 @@ export function useChatController() {
       useSample,
       changeDraft,
       changeTerms,
+      changeTermInput: (text: string) => {
+        if (!busy) {
+          setTermInput(text);
+          setTermStatus("");
+        }
+      },
+      addTerm,
+      removeTerm,
+      undoSelection,
       selectDraft,
       protectSelection,
       closeProviders,
