@@ -179,11 +179,21 @@ class StateRecord(_StrictModel):
             raise PrivacyError("SESSION_RECORD_INVALID") from None
 
 
+class ChatMetadata(_StrictModel):
+    route: Literal["ordinary", "derived_formula"]
+    public_plan: str = Field(max_length=24_000)
+    local_execution: Literal["none", "qwen"]
+    derived_count: int = Field(ge=0, le=8)
+    jev_status: Literal["off", "not_applicable", "pass"]
+    jev: JevAssessment | None = None
+
+
 class MessageRecord(_StrictModel):
     role: Literal["user", "assistant"]
     content: str = Field(max_length=200_000)
     provider: str = Field(default="", max_length=128)
     source_id: str = Field(default="", max_length=128)
+    metadata: ChatMetadata | None = None
 
     @classmethod
     def from_domain(cls, value: Message) -> MessageRecord:
@@ -192,6 +202,7 @@ class MessageRecord(_StrictModel):
             content=value.content,
             provider=value.provider,
             source_id=value.source_id,
+            metadata=value.metadata,
         )
 
 

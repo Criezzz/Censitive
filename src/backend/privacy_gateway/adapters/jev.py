@@ -13,6 +13,7 @@ from privacy_gateway.domain.jev import (
     parse_jev_response,
 )
 from privacy_gateway.domain.redaction import PrivacyError
+from privacy_gateway.domain.serialization import strict_json
 
 
 @dataclass
@@ -75,4 +76,9 @@ class JevGate:
             raise PrivacyError("JEV_TIMEOUT") from None
         except httpx.HTTPError:
             raise PrivacyError("JEV_CONNECTION_FAILED") from None
-        return parse_jev_response(bytes(raw), body, round((time.monotonic() - started) * 1000))
+        return parse_jev_response(
+            bytes(raw),
+            body,
+            round((time.monotonic() - started) * 1000),
+            question_names=set(strict_json(body, code="JEV_PAYLOAD_INVALID")["questions"]),
+        )

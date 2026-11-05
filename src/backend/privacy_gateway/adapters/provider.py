@@ -33,6 +33,9 @@ def serialize_request(provider: Provider, messages: list[dict[str, str]]) -> byt
     options = dict(provider.request_options) if isinstance(provider, ProviderOptions) else {}
     if options.keys() & {"model", "messages"}:
         raise PrivacyError("INVALID_PAYLOAD")
+    formatter = getattr(provider, "request_messages", None)
+    if callable(formatter):
+        messages = formatter(messages)
     try:
         return json.dumps(
             {"model": provider.model, "messages": messages, **options},

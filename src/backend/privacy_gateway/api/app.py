@@ -72,6 +72,7 @@ class PrepareInput(StrictInput):
     request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     draft_identity: DraftIdentity | None = None
     draft_facts: DraftFacts | None = None
+    jev_enabled: bool = False
 
 
 class SnapshotInput(StrictInput):
@@ -513,6 +514,8 @@ def create_app(
         if previous is not None:
             previous.revoke()
         for session in sessions:
+            if session.prepared is not None and session.prepared.jev_gate is not None:
+                service.discard(session)
             if session.private_workbench is not None and session.private_workbench.gate is not None:
                 service._drop_private_preview(session)
 
@@ -639,7 +642,14 @@ def create_app(
             "provider": session.provider.provider_id,
             "model": session.provider.model,
             "messages": [
-                {"role": m.role, "content": m.content, "provider": m.provider}
+                {
+                    "role": m.role,
+                    "content": m.content,
+                    "provider": m.provider,
+                    "metadata": m.metadata.model_dump(mode="json")
+                    if m.metadata is not None
+                    else None,
+                }
                 for m in session.private_history
             ],
             "terms": session.terms,
@@ -777,11 +787,21 @@ def create_app(
         }
 
     def preview_view(prepared: Prepared, session: Session) -> dict[str, object]:
-        message_count = len(json.loads(prepared.body)["messages"])
+        planner_body = prepared.planner_body if prepared.stage == "jev" else prepared.body
+        message_count = len(json.loads(planner_body or b"{}").get("messages", []))
+        if getattr(session.provider, "contract", "") == "chat":
+            message_count -= 1
         return {
             "id": prepared.id,
             "sanitized": prepared.sanitized,
             "body": prepared.body.decode("utf-8"),
+            "body_sha256": hashlib.sha256(prepared.body).hexdigest(),
+            "stage": prepared.stage,
+            "jev_enabled": prepared.jev_gate is not None,
+            "provider": "typesafe-jev" if prepared.stage == "jev" else session.provider.provider_id,
+            "model": prepared.jev_signature[1]
+            if prepared.stage == "jev" and prepared.jev_signature
+            else session.provider.model,
             "expires_in": max(0, ceil(prepared.expires_at - time.monotonic())),
             "detections": [
                 {
@@ -804,7 +824,8 @@ def create_app(
                 "archive_limit_messages": MAX_HISTORY_MESSAGES,
                 "input_tokens": None,
             },
-            "streaming": isinstance(session.provider, StreamingProvider),
+            "streaming": prepared.stage != "jev"
+            and isinstance(session.provider, StreamingProvider),
             "review": None
             if prepared.review_plan is None
             else {
@@ -845,6 +866,11 @@ def create_app(
     @app.post("/api/sessions/{session_id}/prepare")
     async def prepare(session_id: str, data: PrepareInput, request: Request) -> dict[str, object]:
         session = service.session(session_id, owner(request))
+        gate = jev_gates.get(owner(request)) if data.jev_enabled else None
+        if data.jev_enabled and gate is None:
+            raise PrivacyError("JEV_KEY_REQUIRED")
+        if data.jev_enabled and getattr(session.provider, "contract", "") != "chat":
+            raise PrivacyError("JEV_CHAT_UNSUPPORTED")
         prepared = await service.prepare_message(
             session,
             data.text,
@@ -853,6 +879,7 @@ def create_app(
             draft_identity=data.draft_identity,
             draft_facts=data.draft_facts,
         )
+        prepared = service.bind_chat_gate(session, prepared, gate)
         return preview_view(prepared, session)
 
     @app.post("/api/sessions/{session_id}/private-work/prepare")
@@ -942,10 +969,17 @@ def create_app(
         return {"ok": True}
 
     @app.post("/api/sessions/{session_id}/send")
-    async def send(session_id: str, data: SnapshotInput, request: Request) -> dict[str, str]:
+    async def send(session_id: str, data: SnapshotInput, request: Request) -> dict[str, object]:
         session = service.session(session_id, owner(request))
         result = await service.send(session, data.prepared_id)
-        return {"content": result, "provider": session.provider.provider_id}
+        if session.prepared is not None and session.prepared.stage == "jev":
+            return {"jev_preview": preview_view(session.prepared, session)}
+        metadata = session.private_history[-1].metadata if session.private_history else None
+        return {
+            "content": result,
+            "provider": session.provider.provider_id,
+            "metadata": metadata.model_dump(mode="json") if metadata else None,
+        }
 
     @app.post("/api/sessions/{session_id}/send-stream")
     async def send_stream(

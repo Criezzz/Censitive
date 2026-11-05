@@ -5,17 +5,25 @@ import hashlib
 import json
 import re
 import secrets
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from typing import Literal, Protocol
 
 from privacy_gateway.adapters.jev import JevGate
 from privacy_gateway.adapters.provider import Provider, ProviderOptions, serialize_request
+from privacy_gateway.domain.formula_plan import (
+    FormulaPlan,
+    formula_result_schema,
+    validate_formula_values,
+)
 from privacy_gateway.domain.jev import JevAssessment, jev_body
 from privacy_gateway.domain.private_plan import (
     ComposePlan,
     ComputePlan,
+    LocalAnswerPlan,
     PlanInput,
+    TemplateRender,
     execute_compose_plan,
     execute_compute_plan,
     lower_planner_plan,
@@ -25,7 +33,7 @@ from privacy_gateway.domain.private_plan import (
     validate_local_answer_result,
     validate_plan,
 )
-from privacy_gateway.domain.redaction import PrivacyError
+from privacy_gateway.domain.redaction import PREFIX, TOKEN, Binding, PrivacyError
 from privacy_gateway.domain.serialization import strict_json
 
 PLANNER_INSTRUCTION = """Create a processing PLAN for a local private-data worker.
@@ -108,6 +116,110 @@ class PrivateWorker(Protocol):
     ) -> str: ...
 
 
+async def execute_qwen_formulas(
+    worker: PrivateWorker,
+    public_task: str,
+    private_values: Mapping[str, object],
+    formulas: object,
+    schema: dict[str, object],
+) -> str:
+    instruction = json.dumps(formulas, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(instruction) > 4_000:
+        raise PrivacyError("FORMULA_LIMIT")
+    return await worker.answer(
+        public_task,
+        json.dumps({"inputs": private_values}, ensure_ascii=False, default=str),
+        instruction,
+        "formula_json",
+        output_schema=schema,
+    )
+
+
+async def execute_chat_formulas(
+    plan: FormulaPlan,
+    worker: PrivateWorker | None,
+    manifest: Mapping[str, Binding],
+) -> dict[str, str]:
+    if not plan.formulas:
+        return {}
+    if worker is None:
+        raise PrivacyError("FORMULA_WORKER_UNAVAILABLE")
+    values = {name: manifest[plan.aliases[name]].value for name in sorted(plan.required_aliases)}
+    raw = await execute_qwen_formulas(
+        worker,
+        "Execute the declared symbolic formulas and return the formatted values.",
+        values,
+        plan.formulas,
+        formula_result_schema(plan),
+    )
+    return validate_formula_values(plan, raw)
+
+
+async def execute_chat_final_answer(
+    plan: FormulaPlan,
+    worker: PrivateWorker | None,
+    manifest: Mapping[str, Binding],
+    *,
+    user_request: str,
+    denied_literals: tuple[str, ...] = (),
+) -> str:
+    draft: str = plan.raw["answer_template"]
+    referenced = set(TOKEN.findall(draft))
+    visible = set(plan.aliases.values())
+    denied = (*denied_literals, *(b.value for b in manifest.values() if not b.restore_allowed))
+    if any(value and value in TOKEN.sub("", draft) for value in denied):
+        raise PrivacyError("FINAL_ANSWER_FORBIDDEN")
+    if not referenced <= visible:
+        raise PrivacyError("FORMULA_REFERENCE_INVALID")
+    if not referenced and not plan.formulas:
+        return draft
+    if worker is None:
+        raise PrivacyError("FINAL_WORKER_UNAVAILABLE")
+    local_request = user_request
+    for value in sorted({value for value in denied if value}, key=len, reverse=True):
+        local_request = local_request.replace(value, "[private value withheld]")
+    required = referenced | {plan.aliases[name] for name in plan.required_aliases}
+    bindings: dict[str, object] = {}
+    withheld: set[str] = set()
+    for name, token in plan.aliases.items():
+        if token not in required:
+            continue
+        binding = manifest.get(token)
+        if binding is None or binding.token != token:
+            raise PrivacyError("INVALID_BINDING")
+        if binding.restore_allowed and not any(
+            value and value in binding.value for value in denied
+        ):
+            bindings[name] = {"token": token, "value": binding.value}
+        else:
+            withheld.add(token)
+    if withheld & {plan.aliases[name] for name in plan.required_aliases}:
+        raise PrivacyError("FORMULA_INPUT_FORBIDDEN")
+    draft = TOKEN.sub(
+        lambda match: match[0] if match[0] not in withheld else "[private value withheld]",
+        draft,
+    )
+    answer = await worker.answer(
+        local_request,
+        json.dumps({"bindings": bindings}, ensure_ascii=False),
+        json.dumps({"draft": draft, "formulas": plan.formulas}, ensure_ascii=False),
+        "final_answer",
+    )
+    if (
+        not isinstance(answer, str)
+        or not answer.strip()
+        or len(answer) > 12_000
+        or len(answer.encode("utf-8")) > 48_000
+        or PREFIX in answer
+        or "{{" in answer
+        or "}}" in answer
+    ):
+        raise PrivacyError("FINAL_ANSWER_INVALID")
+    if any(value and value in answer for value in denied):
+        raise PrivacyError("FINAL_ANSWER_FORBIDDEN")
+    return answer
+
+
 @dataclass(frozen=True)
 class PreparedWork:
     id: str
@@ -160,6 +272,16 @@ def public_plan_body(provider: Provider, public_task: str) -> bytes:
                 raise PrivacyError("PLANNER_SCHEMA_MISMATCH")
     prompt = (
         PLANNER_INSTRUCTION
+        + (
+            "\nExecution profile: Qwen performs final formula arithmetic locally. "
+            "Only scalar numeric inputs and copied text are supported in compute/compose. "
+            "For compose use render.kind template only. Sign/conditional render and vector "
+            "arithmetic are unsupported by this profile; do not propose them. For requests "
+            "requiring these operations use local_answer, which is explicitly unsupported "
+            "when Jev is enabled. Extraction must request only source facts, never calculate.\n"
+            if getattr(provider, "qwen_formulas", False)
+            else ""
+        )
         + "\n"
         + json.dumps({"public_task": public_task}, ensure_ascii=False, separators=(",", ":"))
     )
@@ -253,7 +375,14 @@ class PrivateWorkbench:
         if work.stage == "jev":
             if self.gate is None or work.public_plan is None:
                 raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
-            if jev_body(work.public_task, work.public_plan) != work.body:
+            if (
+                jev_body(
+                    work.public_task,
+                    work.public_plan,
+                    qwen_formulas=bool(getattr(self.planner, "qwen_formulas", False)),
+                )
+                != work.body
+            ):
                 raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
             assessment = await self.gate.assess(work.body)
             self.latest_jev = assessment
@@ -268,6 +397,7 @@ class PrivateWorkbench:
                 public_task=work.public_task,
                 private_context=work.private_context,
                 public_body_sha256=work.planner_body_sha256,
+                qwen_formulas=bool(getattr(self.planner, "qwen_formulas", False)),
             )
             return replace(result, jev=assessment, trace=(*result.trace, "jev_public_plan_pass"))
         if public_plan_body(self.planner, work.public_task) != work.body:
@@ -279,7 +409,11 @@ class PrivateWorkbench:
             raise PrivacyError("PRIVATE_PLANNER_TIMEOUT") from None
         raw = decode_plan(response)
         if self.gate is not None:
-            body = jev_body(work.public_task, raw)
+            body = jev_body(
+                work.public_task,
+                raw,
+                qwen_formulas=bool(getattr(self.planner, "qwen_formulas", False)),
+            )
             validate_bound_plan = getattr(self.worker, "validate_plan", None)
             if callable(validate_bound_plan):
                 validate_bound_plan(validate_plan(lower_planner_plan(raw)))
@@ -302,6 +436,7 @@ class PrivateWorkbench:
             public_task=work.public_task,
             private_context=work.private_context,
             public_body_sha256=hashlib.sha256(work.body).hexdigest(),
+            qwen_formulas=bool(getattr(self.planner, "qwen_formulas", False)),
         )
 
 
@@ -313,6 +448,7 @@ async def execute_local_plan(
     private_context: str,
     public_body_sha256: str,
     reused: bool = False,
+    qwen_formulas: bool = False,
 ) -> WorkResult:
     if not re.fullmatch(r"[0-9a-f]{64}", public_body_sha256):
         raise PrivacyError("PRIVATE_WORK_APPROVAL_MISMATCH")
@@ -327,17 +463,61 @@ async def execute_local_plan(
     trace: tuple[str, ...]
     if isinstance(plan, (ComposePlan, ComputePlan)):
         computation = plan.compute if isinstance(plan, ComposePlan) else plan
+        if (
+            qwen_formulas
+            and isinstance(plan, ComposePlan)
+            and not isinstance(plan.render, TemplateRender)
+        ):
+            raise PrivacyError("FORMULA_RENDER_UNSUPPORTED")
+        if qwen_formulas and any(item.type == "numbers" for item in computation.inputs):
+            raise PrivacyError("FORMULA_INPUT_INVALID")
         values = (
             await worker.extract(public_task, private_context, computation.inputs)
             if computation.inputs
             else {}
         )
-        trace = (origin, "plan_validated", "local_inputs_grounded", "local_compute")
-        if isinstance(plan, ComposePlan):
+        trace = (origin, "plan_validated", "local_inputs_grounded")
+        if qwen_formulas:
+            schema: dict[str, object] = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    name: {"type": "string" if expr.op == "text_ref" else "number"}
+                    for name, expr in computation.outputs.items()
+                },
+                "required": list(computation.outputs),
+            }
+            answer = await execute_qwen_formulas(
+                worker,
+                public_task,
+                values,
+                {
+                    name: asdict(
+                        expr, dict_factory=lambda pairs: {k: v for k, v in pairs if v is not None}
+                    )
+                    for name, expr in computation.outputs.items()
+                },
+                schema,
+            )
+            answer = validate_local_answer_result(
+                LocalAnswerPlan(3, "local_answer", "Declared formulas", "json", schema), answer
+            )
+            trace += ("local_qwen_formula_values", "local_output_shape_validated")
+            if isinstance(plan, ComposePlan):
+                assert isinstance(plan.render, TemplateRender)
+                parsed = json.loads(answer, parse_float=Decimal)
+                answer = re.sub(
+                    r"\{\{([A-Za-z_][A-Za-z0-9_-]*)\}\}",
+                    lambda match: str(parsed[match[1]]),
+                    plan.render.text,
+                )
+                trace += ("local_template_rendered",)
+        elif isinstance(plan, ComposePlan):
             answer = execute_compose_plan(plan, values)
-            trace += ("local_template_rendered",)
+            trace += ("local_compute", "local_template_rendered")
         else:
             answer = serialize_result(execute_compute_plan(plan, values))
+            trace += ("local_compute",)
     else:
         if plan.output_schema is None:
             answer = await worker.answer(

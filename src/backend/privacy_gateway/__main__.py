@@ -24,7 +24,9 @@ from privacy_gateway.domain.redaction import PrivacyError
 def main() -> None:
     parser = argparse.ArgumentParser(description="Censitive privacy gateway")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--provider", choices=("demo", "codex", "openai", "local"), default="demo")
+    parser.add_argument(
+        "--provider", choices=("demo", "codex", "openai", "local"), default="openai"
+    )
     parser.add_argument("--detector", choices=("rules", "qwen"), default="rules")
     parser.add_argument("--local-model", choices=("4b", "8b"), default="8b")
     parser.add_argument("--semantic-mode", choices=("literal", "state"), default="literal")
@@ -41,8 +43,6 @@ def main() -> None:
     gateway = Gateway()
     openai = OpenAIProvider.from_environment()
     if args.provider == "openai":
-        if code := openai.configuration_error():
-            parser.exit(2, f"OpenAI API configuration: {code}\n")
         gateway = Gateway(openai)
     local = None
     if args.provider == "codex":

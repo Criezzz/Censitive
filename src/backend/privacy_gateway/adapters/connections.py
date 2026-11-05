@@ -152,13 +152,17 @@ class ProviderConnections:
         return self.codex
 
     def private_work_available(self, provider: Provider) -> bool:
-        return isinstance(provider, CodexProvider) and provider.model == CodexProvider.model
+        return (isinstance(provider, OpenAIProvider) and not provider.configuration_error()) or (
+            isinstance(provider, CodexProvider) and provider.model == CodexProvider.model
+        )
 
     async def private_work(
         self, provider: Provider, worker: PrivateWorker | None
     ) -> PrivateWorkbench:
         if worker is None or not self.private_work_available(provider):
             raise PrivacyError("PRIVATE_WORK_UNAVAILABLE")
+        if isinstance(provider, OpenAIProvider):
+            return PrivateWorkbench(provider.private_planner(), worker)
         assert isinstance(provider, CodexProvider)
         try:
             planner = await asyncio.to_thread(
