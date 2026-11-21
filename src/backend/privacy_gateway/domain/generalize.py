@@ -1,12 +1,9 @@
-import copy
 import re
 from typing import Any
 
 from privacy_gateway.domain.presend import literal_pattern
 from privacy_gateway.domain.serialization import strict_json
 
-CHECK_LIMIT = 12_000
-MAX_EXTRA_SPAN_WORDS = 3
 GENERIC_CAPITAL_WORDS = frozenset(
     "europe european asia asian africa african america american "
     "north south latin central middle east eastern west western northern southern southeast "
@@ -42,7 +39,6 @@ LEAK_SCHEMA: dict[str, Any] = {
     "properties": {
         "items": {
             "type": "array",
-            "maxItems": 64,
             "items": {
                 "type": "object",
                 "additionalProperties": False,
@@ -56,49 +52,19 @@ LEAK_SCHEMA: dict[str, Any] = {
         }
     },
 }
-SLOT_TYPES = ("PERSON", "ORG", "PLACE", "PRODUCT", "ID", "DATE", "AMOUNT", "OTHER")
-_TEMPLATE_SLOT = re.compile(
-    r"(?i)(?:(?:(?:company|person|first|last|full|artist|recipient|your)\s+)*"
-    r"(?:name|word|recipient|placeholder)(?:\s+(?:name|word))*|"
-    r"(?:PRESIDIO_\w+|PG_\w+|(?:PERSON|ORG|PLACE|PRODUCT|ID|DATE|AMOUNT|OTHER)_\d+))"
-)
-SLOT_PATTERN = re.compile(r"\[(?:" + "|".join(SLOT_TYPES) + r")_\d+\]", re.I)
 
 
-def leak_contract(variant: str = "dev", slots: str = "description") -> tuple[str, dict[str, Any]]:
-    instruction = LEAK_INSTRUCTION
-    schema = copy.deepcopy(LEAK_SCHEMA)
-    if variant == "neutral":
-        instruction = instruction.replace("is Wadzpay legitimate?", "is Zentrix Bank regulated?")
-        instruction = instruction.replace("posts (including SEO locations)", "posts")
-        instruction = instruction.replace(
-            "slogans or names", "slogans, a name in a wedding toast or names"
-        )
-    if slots == "typed":
-        instruction += (
-            "\nAlso return type for every item: "
-            + ", ".join(SLOT_TYPES)
-            + ". Code constructs typed tokens; replacement descriptions are unused."
-        )
-        item = schema["properties"]["items"]["items"]
-        item["required"].append("type")
-        item["properties"]["type"] = {"type": "string", "enum": list(SLOT_TYPES)}
-    return instruction, schema
+def leak_contract() -> tuple[str, dict[str, Any]]:
+    instruction = LEAK_INSTRUCTION.replace("is Wadzpay legitimate?", "is Zentrix Bank regulated?")
+    instruction = instruction.replace("posts (including SEO locations)", "posts")
+    instruction = instruction.replace(
+        "slogans or names", "slogans, a name in a wedding toast or names"
+    )
+    return instruction, LEAK_SCHEMA
 
 
-def placeholders(prompt: str, candidate_spans: list[str]) -> list[re.Match[str]]:
-    return [
-        match
-        for match in _PLACEHOLDER.finditer(prompt)
-        if _TEMPLATE_SLOT.fullmatch(match.group()[1:-1])
-        and not any(
-            re.search(literal_pattern(c), match.group()[1:-1], re.I) for c in candidate_spans
-        )
-    ]
-
-
-def candidates(original: str, prompt: str, *, version: str = "v5") -> list[str]:
-    protected = list(_PLACEHOLDER.finditer(prompt)) if version == "v5" else placeholders(prompt, [])
+def candidates(original: str, prompt: str) -> list[str]:
+    protected = list(_PLACEHOLDER.finditer(prompt))
     tokens = list(_CANDIDATE_TOKEN.finditer(prompt))
     result: list[str] = []
     start: int | None = None
@@ -108,10 +74,8 @@ def candidates(original: str, prompt: str, *, version: str = "v5") -> list[str]:
     def flush() -> None:
         if start is not None:
             span = prompt[start:end]
-            if (
-                span.casefold() not in {value.casefold() for value in result}
-                and re.search(literal_pattern(span), original, re.IGNORECASE)
-                and len(result) < 32
+            if span.casefold() not in {value.casefold() for value in result} and re.search(
+                literal_pattern(span), original, re.IGNORECASE
             ):
                 result.append(span)
 
@@ -163,28 +127,11 @@ def candidates(original: str, prompt: str, *, version: str = "v5") -> list[str]:
     return result
 
 
-def detector_candidates(original: str, prompt: str, findings: list[Any]) -> list[str]:
-    result: list[str] = []
-    for finding in findings:
-        quote = finding.get("quote", "")
-        if (
-            isinstance(quote, str)
-            and quote.strip()
-            and len(quote.split()) <= 4
-            and quote in original
-            and re.search(literal_pattern(quote), original, re.I)
-            and re.search(literal_pattern(quote), prompt, re.I)
-            and quote.casefold() not in {c.casefold() for c in result}
-        ):
-            result.append(quote)
-    return result
-
-
 def parse_items(raw: str) -> list[Any]:
     data = strict_json(raw, code="LEAK_CHECK_INVALID")
     if not isinstance(data, dict) or set(data) != {"items"}:
         raise ValueError("LEAK_CHECK_INVALID")
-    if not isinstance(data["items"], list) or len(data["items"]) > 64:
+    if not isinstance(data["items"], list):
         raise ValueError("LEAK_CHECK_INVALID")
     return data["items"]
 
@@ -192,11 +139,7 @@ def parse_items(raw: str) -> list[Any]:
 def generic_replacement_reason(
     prompt: str, span: str, value: str, replacement: str, *, allow_initial_capital: bool
 ) -> str | None:
-    if len(replacement) > 48:
-        return "too_many_characters"
     words = re.findall(r"[^\W\d_]+", replacement)
-    if len(words) > 6:
-        return "too_many_words"
     if any(char.isdigit() for char in replacement):
         return "contains_digits"
     if (
@@ -224,163 +167,67 @@ def generic_replacement_reason(
 
 
 def substitute(
-    prompt: str,
-    items: list[Any],
-    original: str,
-    candidate_spans: list[str],
-    *,
-    version: str = "v6b",
-    slots: str = "description",
-) -> tuple[str, dict[str, str], list[dict[str, Any]]]:
-    if version not in {"v5", "v6b"}:
-        raise ValueError("LEAKCHECK_VERSION_INVALID")
+    prompt: str, items: list[Any], original: str, candidate_spans: list[str]
+) -> tuple[str, dict[str, str]]:
     edits: list[tuple[int, int, str]] = []
     mapping: dict[str, str] = {}
-    log = []
-    protected = (
-        list(_PLACEHOLDER.finditer(prompt))
-        if version == "v5"
-        else placeholders(prompt, candidate_spans)
-    )
-    typed = slots == "typed"
-    if typed and version != "v6b":
-        raise ValueError("TYPED_SLOTS_REQUIRE_V6B")
-    value_tokens: dict[str, str] = {}
+    protected = list(_PLACEHOLDER.finditer(prompt))
     for item in items:
-        reason = "invalid_item"
-        sub_reason = None
-        matches = []
         if (
             isinstance(item, dict)
-            and set(item)
-            == (
-                {"span", "replacement", "task_needs_exact_value", "type"}
-                if typed
-                else {"span", "replacement", "task_needs_exact_value"}
-            )
+            and set(item) == {"span", "replacement", "task_needs_exact_value"}
             and isinstance(item["span"], str)
             and item["span"].strip()
             and isinstance(item["replacement"], str)
             and item["replacement"].strip()
             and type(item["task_needs_exact_value"]) is bool
-            and (not typed or item["type"] in SLOT_TYPES)
         ):
             span, replacement = item["span"], item["replacement"]
-            all_matches = list(re.finditer(literal_pattern(span), prompt, re.IGNORECASE))
-            matches = [
-                m
-                for m in all_matches
-                if version == "v5"
-                or not any(p.start() < m.end() and m.start() < p.end() for p in protected)
-            ]
+            matches = list(re.finditer(literal_pattern(span), prompt, re.IGNORECASE))
             source = re.search(literal_pattern(span), original, re.IGNORECASE)
             value = source.group() if source else span
-            placeholder_span = bool(
-                _PLACEHOLDER.search(span)
-                if version == "v5"
-                else placeholders(span, candidate_spans)
-            ) or (
-                bool(all_matches)
+            echo = " ".join(replacement.casefold().split()).rstrip(".")
+            if _PLACEHOLDER.search(span) or (
+                matches
                 and all(
                     any(p.start() <= m.start() and m.end() <= p.end() for p in protected)
-                    for m in all_matches
+                    for m in matches
                 )
-            )
-            licensed = [
-                m
-                for candidate in candidate_spans
-                for m in re.finditer(literal_pattern(candidate), span, re.IGNORECASE)
-            ]
-            if version == "v6b" and licensed:
-                candidate_text = span[
-                    min(m.start() for m in licensed) : max(m.end() for m in licensed)
-                ]
-                source = re.search(literal_pattern(candidate_text), original, re.I)
-                value = source.group() if source else ""
-            exact_licensed = (
-                any(re.fullmatch(literal_pattern(c), span, re.I) for c in candidate_spans)
-                and source is not None
-            )
-            if typed and value:
-                replacement = value_tokens.get(value.casefold(), "")
-                if not replacement:
-                    index = 1
-                    replacement = f"[{item['type']}_{index}]"
-                    while (
-                        replacement in mapping
-                        or replacement.casefold() in (prompt + original).casefold()
-                    ):
-                        index += 1
-                        replacement = f"[{item['type']}_{index}]"
-            extra_words = sum(
-                not any(c.start() <= word.start() and word.end() <= c.end() for c in licensed)
-                for word in _CANDIDATE_TOKEN.finditer(span)
-            )
-            echo = " ".join(replacement.casefold().split()).rstrip(".")
-            if placeholder_span:
-                reason = "placeholder_span"
-            elif not typed and (
-                re.fullmatch(r"(?:a |an |the )?generic(?:\s+.*)?", echo)
-                or echo
-                in {
-                    "exact text in rewritten prompt",
-                    "a short, non-identifying description that preserves the role of the value",
-                }
             ):
-                reason = "boilerplate_replacement"
+                continue
+            elif re.fullmatch(r"(?:a |an |the )?generic(?:\s+.*)?", echo) or echo in {
+                "exact text in rewritten prompt",
+                "a short, non-identifying description that preserves the role of the value",
+            }:
+                continue
             elif not matches:
-                reason = "span_absent"
-            elif item["task_needs_exact_value"] and (version == "v5" or exact_licensed):
-                reason = "kept_task_needs_exact_value"
-            elif not typed and (
-                sub_reason := generic_replacement_reason(
-                    prompt,
-                    span,
-                    value,
-                    replacement,
-                    allow_initial_capital=all(
-                        m.group()[0].isupper()
-                        or re.search(r"(?:^|[.!?\n])\s*$", prompt[: m.start()]) is not None
-                        for m in matches
-                    ),
-                )
+                continue
+            elif item["task_needs_exact_value"]:
+                continue
+            elif generic_replacement_reason(
+                prompt,
+                span,
+                value,
+                replacement,
+                allow_initial_capital=all(
+                    m.group()[0].isupper()
+                    or re.search(r"(?:^|[.!?\n])\s*$", prompt[: m.start()]) is not None
+                    for m in matches
+                ),
             ):
-                reason = "replacement_not_generic"
+                continue
             elif any(a < m.end() and m.start() < b for m in matches for a, b, _ in edits):
-                reason = "overlap"
-            elif not typed and any(
-                (label == replacement and prior != value)
-                if version == "v5"
-                else (
-                    label.casefold() == replacement.casefold()
-                    and prior.casefold() != value.casefold()
-                )
-                for label, prior in mapping.items()
-            ):
-                reason = "ambiguous_mapping"
-            elif not (
-                any(candidate.casefold() in span.casefold() for candidate in candidate_spans)
-                if version == "v5"
-                else licensed
-            ):
-                reason = "span_without_candidate"
-            elif version == "v6b" and extra_words > MAX_EXTRA_SPAN_WORDS:
-                reason = "span_too_broad"
-            elif version == "v6b" and not value:
-                reason = "candidate_source_ambiguous"
+                continue
+            elif any(label == replacement and prior != value for label, prior in mapping.items()):
+                continue
+            elif not any(candidate.casefold() in span.casefold() for candidate in candidate_spans):
+                continue
             else:
-                reason = "accepted"
                 edits.extend((m.start(), m.end(), replacement) for m in matches)
                 mapping[replacement] = value
-                if typed:
-                    value_tokens[value.casefold()] = replacement
-        entry = {"item": item, "reason": reason, "matches": len(matches)}
-        if sub_reason is not None:
-            entry["sub_reason"] = sub_reason
-        log.append(entry)
     for start, end, replacement in sorted(edits, reverse=True):
         prompt = prompt[:start] + replacement + prompt[end:]
-    return prompt, mapping, log
+    return prompt, mapping
 
 
 def new_numbers(answer: str, original: str, remote_answer: str) -> list[str]:

@@ -5,7 +5,6 @@ import { SessionPanel } from "./views/SessionPanel";
 import { ProviderHeader } from "./views/ProviderHeader";
 import { ChatPanel } from "./views/ChatPanel";
 import { PrivacyPanel } from "./views/PrivacyPanel";
-import { PrivateWorkPanel } from "./views/PrivateWorkPanel";
 import { WorkflowPanel } from "./views/WorkflowPanel";
 import { getWorkflowStatus } from "./controllers/workspace";
 
@@ -19,6 +18,7 @@ export function App() {
       {chat.model.showProviders && (
         <ProvidersDialog
           current={chat.model.provider}
+          currentModel={chat.model.providerConfirmed ? chat.model.model : ""}
           request={api}
           onApply={chat.actions.selectProvider}
           onClose={chat.actions.closeProviders}
@@ -28,21 +28,10 @@ export function App() {
       <main className="workspace" id="main-content">
         <ProviderHeader {...chat} />
         <WorkflowPanel status={getWorkflowStatus(chat.model)} />
-        <nav className="panel-links" aria-label="Các khu vực làm việc">
-          <a href="#chat-panel">Hội thoại</a>
-          <a href="#privacy-panel">Kiểm tra bản gửi</a>
-          <a href="#protected-info">Thông tin được bảo vệ</a>
-          <a href="#private-work-panel">Private work local</a>
-          <a href="#provider-session">Provider và phiên</a>
-          <a href="#session-audit" onClick={chat.actions.openAudit}>
-            Nhật ký phiên
-          </a>
-        </nav>
         <div className="work-area">
           <ChatPanel {...chat} />
           <PrivacyPanel {...chat} />
         </div>
-        <PrivateWorkPanel {...chat} />
       </main>
     </div>
   );

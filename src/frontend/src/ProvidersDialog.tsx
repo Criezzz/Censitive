@@ -17,6 +17,8 @@ export function ProvidersDialog(props: ProviderDialogProps) {
     action,
     apply,
     selectChoice,
+    model,
+    setModel,
   } = useProviderConnections(props);
   return (
     <dialog
@@ -30,8 +32,7 @@ export function ProvidersDialog(props: ProviderDialogProps) {
     >
       <div className="connection-heading">
         <div>
-          <div className="eyebrow">THIẾT LẬP HỘI THOẠI</div>
-          <h2 id="providers-title">Provider & kết nối</h2>
+          <h2 id="providers-title">Kết nối AI</h2>
         </div>
         <button
           className="quiet"
@@ -42,115 +43,40 @@ export function ProvidersDialog(props: ProviderDialogProps) {
           ×
         </button>
       </div>
-      <p className="connection-intro">
-        OpenAI API là kết nối ưu tiên cho hội thoại mới. Chọn đích nhận rồi
-        duyệt từng bản gửi.
-      </p>
       <div className="connection-layout">
         <div className="provider-options" aria-label="Nhà cung cấp">
-          {providers
-            .slice()
-            .sort(
-              (a, b) =>
-                Number(b.id === "openai-api") - Number(a.id === "openai-api"),
-            )
-            .map((p) => (
-              <button
-                key={p.id}
-                className={
-                  selected === p.id
-                    ? "provider-option selected"
-                    : "provider-option"
-                }
-                aria-pressed={selected === p.id}
-                disabled={working}
-                onClick={() => selectChoice(p.id)}
-              >
-                <span className="provider-symbol">
-                  {p.id === "local-demo"
-                    ? "◇"
-                    : p.id === "antigravity-google"
-                      ? "✦"
-                      : "⌘"}
-                </span>
-                <span>
-                  <strong>{p.name}</strong>
-                  <small>
-                    {p.id === "local-demo"
-                      ? "Không cần tài khoản"
-                      : p.id === "local-qwen"
-                        ? "Mô hình chạy trên máy"
-                        : p.id === "openai-api"
-                          ? "API key · cloud"
-                          : p.id === "antigravity-google"
-                            ? "Tài khoản Google · CLI"
-                            : "Tài khoản ChatGPT · cloud"}
-                  </small>
-                </span>
-                {current === p.id && (
-                  <span className="current-provider">Đang dùng</span>
-                )}
-              </button>
-            ))}
+          {providers.map((p) => (
+            <button
+              key={p.id}
+              className={
+                selected === p.id
+                  ? "provider-option selected"
+                  : "provider-option"
+              }
+              aria-pressed={selected === p.id}
+              disabled={working}
+              onClick={() => selectChoice(p.id)}
+            >
+              <span className="provider-symbol">⌘</span>
+              <span>
+                <strong>{p.name}</strong>
+              </span>
+              {current === p.id && (
+                <span className="current-provider">Đang dùng</span>
+              )}
+            </button>
+          ))}
         </div>
         {chosen && (
           <section className="connection-detail" aria-label="Chi tiết kết nối">
             <h3>{chosen.name}</h3>
-            {chosen.id === "local-demo" ? (
-              <p>
-                Phản hồi mẫu chạy tại máy. Phù hợp kiểm tra che và phục hồi mà
-                không dùng model cloud.
+            {chosen.id === "openai-api" ? (
+              <p role="status">
+                {chosen.status === "configured" || chosen.status === "ready"
+                  ? "Gọi OpenAI sau khi bạn duyệt bản gửi. Khóa API được giữ trên máy."
+                  : (connectionMessages[chosen.code] ??
+                    "Chưa có OPENAI_API_KEY. Đặt biến môi trường này rồi khởi động lại.")}
               </p>
-            ) : chosen.id === "local-qwen" ? (
-              <p>
-                Qwen trả lời bằng mô hình trên máy sau khi bạn duyệt bản đã che.
-                Dùng chung runtime với bộ phát hiện; không gửi hội thoại lên
-                cloud.
-              </p>
-            ) : chosen.id === "openai-api" ? (
-              <>
-                <p>
-                  Gọi OpenAI trực tiếp sau khi bạn duyệt nội dung đã che. API
-                  key và model được cấu hình ở backend trên máy.
-                </p>
-                <p role="status">
-                  {chosen.status === "configured" || chosen.status === "ready"
-                    ? "Đã có cấu hình key và model. Chưa xác minh bằng lượt gọi thật."
-                    : (connectionMessages[chosen.code] ??
-                      "Chưa có cấu hình API hợp lệ. Đặt OPENAI_API_KEY và CENSITIVE_OPENAI_MODEL cho backend, rồi khởi động lại.")}
-                </p>
-                <p>
-                  Key không được gửi tới trình duyệt. Quyền dùng model, hạn mức
-                  và chi phí do tài khoản OpenAI API của bạn quyết định.
-                </p>
-                <details className="connection-help">
-                  <summary>Hướng dẫn cấu hình OpenAI API</summary>
-                  <ol>
-                    <li>
-                      Đặt <code>OPENAI_API_KEY</code> trong cấu hình backend
-                      trên máy.
-                    </li>
-                    <li>
-                      Đặt <code>CENSITIVE_OPENAI_MODEL</code> nếu cần chọn model
-                      khác model mặc định.
-                    </li>
-                    <li>
-                      Khởi động lại backend, mở lại hộp này rồi chọn “Dùng cho
-                      hội thoại này”.
-                    </li>
-                  </ol>
-                  <p>
-                    Không nhập API key vào ô chat. Đọc cấu hình chỉ xác nhận
-                    key/model có mặt; chưa gọi OpenAI để kiểm thử kết nối.
-                  </p>
-                </details>
-              </>
-            ) : chosen.id === "antigravity-google" ? (
-              <AntigravityConnectionCard
-                chosen={chosen}
-                working={working}
-                onCheck={() => void action("/providers/antigravity/check")}
-              />
             ) : (
               <>
                 <label htmlFor="auth-method">Cách kết nối</label>
@@ -232,33 +158,26 @@ export function ProvidersDialog(props: ProviderDialogProps) {
                   <p>
                     Phiên đăng nhập dùng chung với Codex CLI/IDE trên máy. Đóng
                     hộp này không đăng xuất tài khoản. Kiểm tra kết nối chưa xác
-                    nhận hạn mức model; hạn mức được kiểm khi gửi lượt chat.
+                    nhận hạn mức mô hình; hạn mức được kiểm khi gửi câu hỏi.
                   </p>
                 </details>
               </>
             )}
-            <label htmlFor="provider-model">Model</label>
+            <label htmlFor="provider-model">Mô hình</label>
             <select
               id="provider-model"
-              value={chosen.model}
-              disabled
-              onChange={() => {}}
+              value={model}
+              disabled={working || (chosen.models?.length ?? 0) < 2}
+              onChange={(event) => setModel(event.target.value)}
             >
-              <option value={chosen.model}>
-                {chosen.model || "Chưa cấu hình model"}
-              </option>
+              {(chosen.models?.length ? chosen.models : [chosen.model]).map(
+                (item) => (
+                  <option key={item} value={item}>
+                    {item || "Chưa chọn mô hình"}
+                  </option>
+                ),
+              )}
             </select>
-            <small className="model-note">
-              {chosen.id === "local-demo"
-                ? "Bộ phản hồi mẫu"
-                : chosen.id === "openai-api"
-                  ? "Model được cấu hình ở backend; chưa kiểm chứng bằng API thật"
-                  : chosen.id === "codex-chatgpt"
-                    ? "Model từng được kiểm chứng cho tích hợp; vẫn cần kiểm tra kết nối hiện tại"
-                    : chosen.id === "antigravity-google"
-                      ? "Model do backend khai báo; chat đang bị khóa vì chưa kiểm chứng cách ly context/tools"
-                      : "Model đã được kiểm chứng cho tích hợp hiện tại"}
-            </small>
           </section>
         )}
       </div>
@@ -268,10 +187,7 @@ export function ProvidersDialog(props: ProviderDialogProps) {
         </p>
       )}
       <div className="connection-footer">
-        <p>
-          Đổi provider sẽ xóa bản duyệt hiện tại. Lịch sử đã che chỉ chuyển tới
-          đích mới sau lần duyệt tiếp theo.
-        </p>
+        <p>Đổi kết nối hoặc mô hình sẽ xóa bản duyệt hiện tại.</p>
         <button
           className="primary"
           disabled={!chosen || working || !canSelect}
@@ -281,69 +197,5 @@ export function ProvidersDialog(props: ProviderDialogProps) {
         </button>
       </div>
     </dialog>
-  );
-}
-
-function AntigravityConnectionCard({
-  chosen,
-  working,
-  onCheck,
-}: {
-  chosen: NonNullable<ReturnType<typeof useProviderConnections>["chosen"]>;
-  working: boolean;
-  onCheck: () => void;
-}) {
-  const codeMessage =
-    chosen.code === "CONNECTION_FAILED"
-      ? "Không thể kiểm tra kết nối Antigravity trên máy."
-      : (connectionMessages[chosen.code] ?? "");
-  const statusText = working
-    ? "Đang kiểm tra thông tin kết nối…"
-    : chosen.status === "unchecked"
-      ? "Chưa kiểm tra kết nối trên máy."
-      : chosen.authenticated === true
-        ? "Đã xác thực tài khoản Google. Chưa đủ điều kiện gửi chat: chưa kiểm chứng cách ly context/tools."
-        : codeMessage
-          ? codeMessage
-          : chosen.authenticated === false
-            ? "Chưa xác nhận phiên đăng nhập Google."
-            : "Kết nối Antigravity hiện chưa sẵn sàng.";
-  const quota = chosen.quota;
-  const quotaEntries = Array.isArray(quota)
-    ? quota.map((bucket) => ({
-        label: `${bucket.group} · ${bucket.window}`,
-        value: `≈ ${(bucket.remaining_fraction * 100).toFixed(3)}% còn lại · đặt lại ${bucket.reset_time}`,
-      }))
-    : [];
-
-  return (
-    <>
-      <p>
-        Antigravity dùng tài khoản Google qua CLI chính thức. Kiểm tra dưới đây
-        chỉ đọc metadata kết nối; không gửi nội dung hội thoại và không đăng
-        nhập thay bạn.
-      </p>
-      <div className="connection-status unavailable" role="status">
-        {statusText}
-      </div>
-      <p className="connection-boundary-warning">
-        Chưa đủ điều kiện gửi chat: chưa kiểm chứng cách ly context/tools.
-      </p>
-      {quotaEntries.length > 0 && (
-        <dl className="connection-metadata" aria-label="Metadata Antigravity">
-          {quotaEntries.map(({ label, value }) => (
-            <div key={label}>
-              <dt>{label}</dt>
-              <dd>{String(value)}</dd>
-            </div>
-          ))}
-        </dl>
-      )}
-      <div className="connection-actions">
-        <button className="secondary" disabled={working} onClick={onCheck}>
-          Kiểm tra kết nối
-        </button>
-      </div>
-    </>
   );
 }

@@ -7,12 +7,14 @@ import {
 } from "../data/providers";
 export interface ProviderDialogProps {
   current: string;
+  currentModel: string;
   request: Request;
   onApply: (provider: string, model: string) => Promise<void>;
   onClose: () => void;
 }
 export function useProviderConnections({
   current,
+  currentModel,
   request,
   onApply,
   onClose,
@@ -23,11 +25,38 @@ export function useProviderConnections({
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const chosen = providers.find((p) => p.id === selected);
+  const [model, setModel] = useState(currentModel);
+  const models = chosen?.models?.length
+    ? chosen.models
+    : chosen?.model
+      ? [chosen.model]
+      : [];
   const canSelect =
-    chosen?.id !== "antigravity-google" &&
+    models.includes(model) &&
     (chosen?.status === "ready" ||
       (chosen?.id === "openai-api" && chosen.status === "configured"));
   const signingIn = providers.some((p) => p.status === "signing_in");
+
+  function applyCatalog(result: Catalog) {
+    const visible = result.providers
+      .filter((p) => p.id === "openai-api" || p.id === "codex-chatgpt")
+      .sort(
+        (a, b) => Number(b.id === "openai-api") - Number(a.id === "openai-api"),
+      );
+    const next = visible.find((p) => p.id === selected) ?? visible[0];
+    const available = next?.models?.length
+      ? next.models
+      : next?.model
+        ? [next.model]
+        : [];
+    setProviders(visible);
+    setSelected(next?.id ?? "");
+    setModel((currentValue) =>
+      next?.id === selected && available.includes(currentValue)
+        ? currentValue
+        : (available[0] ?? ""),
+    );
+  }
 
   useEffect(() => {
     const element = dialog.current!;
@@ -36,10 +65,12 @@ export function useProviderConnections({
     let active = true;
     request<Catalog>("/providers")
       .then((result) => {
-        if (active) setProviders(result.providers);
+        if (active) {
+          applyCatalog(result);
+        }
       })
       .catch(() => {
-        if (active) setError("Không thể tải danh sách provider.");
+        if (active) setError("Không thể tải danh sách bên nhận.");
       });
     return () => {
       active = false;
@@ -57,7 +88,7 @@ export function useProviderConnections({
       pending = true;
       request<Catalog>("/providers")
         .then((result) => {
-          if (active) setProviders(result.providers);
+          if (active) applyCatalog(result);
         })
         .catch(() => {
           if (active) setError("Mất kết nối ứng dụng. Hãy kiểm tra lại.");
@@ -70,7 +101,7 @@ export function useProviderConnections({
       active = false;
       window.clearInterval(timer);
     };
-  }, [signingIn, working, request]);
+  }, [signingIn, working, request, selected]);
 
   async function action(path: string) {
     if (working) return;
@@ -78,12 +109,12 @@ export function useProviderConnections({
     setError("");
     try {
       const result = await request<Catalog>(path, "POST");
-      setProviders(result.providers);
+      applyCatalog(result);
     } catch (reason) {
       const code = reason instanceof Error ? reason.message : "";
       setError(
         connectionMessages[code] ??
-          "Không thể kết nối provider. Hãy thử kiểm tra lại.",
+          "Không thể kết nối bên nhận. Hãy thử kiểm tra lại.",
       );
     } finally {
       setWorking(false);
@@ -95,13 +126,13 @@ export function useProviderConnections({
     setWorking(true);
     setError("");
     try {
-      await onApply(chosen.id, chosen.model);
+      await onApply(chosen.id, model);
       onClose();
     } catch (reason) {
       const code = reason instanceof Error ? reason.message : "";
       setError(
         connectionMessages[code] ??
-          "Chưa xác nhận được kết quả đổi provider. Hãy thử lại để xác nhận đích nhận trước khi gửi.",
+          "Chưa xác nhận được kết quả đổi bên nhận. Hãy thử lại để xác nhận đích nhận trước khi gửi.",
       );
     } finally {
       setWorking(false);
@@ -110,6 +141,17 @@ export function useProviderConnections({
 
   function selectChoice(id: string) {
     setSelected(id);
+    const next = providers.find((p) => p.id === id);
+    const available = next?.models?.length
+      ? next.models
+      : next?.model
+        ? [next.model]
+        : [];
+    setModel(
+      id === current && available.includes(currentModel)
+        ? currentModel
+        : (available[0] ?? ""),
+    );
     setError("");
   }
   return {
@@ -124,5 +166,7 @@ export function useProviderConnections({
     action,
     apply,
     selectChoice,
+    model,
+    setModel,
   };
 }

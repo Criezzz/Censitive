@@ -1,37 +1,25 @@
 import { useEffect, useRef } from "react";
 import type { PanelProps } from "./PanelProps";
-import { samples } from "../data/samples";
-import { AuditPanel } from "./AuditPanel";
 import { Shield } from "./Shield";
 import { providerName } from "../data/providers";
 
-export function ChatPanel(props: PanelProps) {
+export function ChatPanel({ model, actions, elements }: PanelProps) {
   const {
     provider,
     messages,
-    provisional,
-    semantic,
     phase,
     cancelPending,
-    cloud,
-    localModel,
     error,
     draft,
     session,
     providerConfirmed,
-    recoveryStatus,
-    factsConfirmed,
-    identityConfirmed,
-    factState,
     draftSelection,
     selectionIssue,
     selectionNotice,
     selectionUndoAvailable,
     busy,
-  } = props.model;
+  } = model;
   const {
-    semanticSample,
-    useSample,
     clearError,
     selectDraft,
     protectSelection,
@@ -40,9 +28,10 @@ export function ChatPanel(props: PanelProps) {
     prepare,
     cancelPrepare,
     cancel,
-  } = props.actions;
-  const { bottom, input } = props.elements;
-  const chatInputLocked = busy;
+    reset,
+  } = actions;
+  const { bottom, input } = elements;
+  const answered = messages.some((message) => message.role === "assistant");
   const followLatest = useRef(true);
   useEffect(() => {
     followLatest.current = true;
@@ -50,12 +39,12 @@ export function ChatPanel(props: PanelProps) {
   useEffect(() => {
     const container = bottom.current?.parentElement;
     if (!container) return;
-    if (messages.length === 0 && provisional === null) {
+    if (messages.length === 0) {
       container.scrollTop = 0;
       followLatest.current = true;
     } else if (followLatest.current)
       container.scrollTop = container.scrollHeight;
-  }, [messages, provisional, bottom]);
+  }, [messages, bottom]);
   return (
     <section
       className="conversation"
@@ -65,7 +54,6 @@ export function ChatPanel(props: PanelProps) {
     >
       <div className="conversation-heading">
         <h2>Nội dung hội thoại</h2>
-        <span>Bản gốc · trên máy</span>
       </div>
       <div
         className="chat-scroll"
@@ -78,48 +66,12 @@ export function ChatPanel(props: PanelProps) {
             80;
         }}
       >
-        {messages.length === 0 && provisional === null ? (
-          <div className="welcome">
+        {messages.length === 0 ? (
+          <div className="welcome" hidden={phase !== "idle"}>
             <div className="welcome-icon">
               <Shield />
             </div>
             <h2>Bạn muốn trao đổi điều gì?</h2>
-            <p>
-              {semantic
-                ? "Qwen đọc ngữ cảnh ngay trên máy để đề xuất che thông tin nhạy cảm. Bạn xem lại bản gửi trước khi provider trả lời."
-                : "Nhập yêu cầu, chọn thông tin cần giữ riêng và kiểm tra bản chuẩn bị gửi."}
-            </p>
-            {provider === "openai-api" && (
-              <p>
-                Khi cần tính từ giá trị đã che, OpenAI lập công thức và Qwen
-                thực hiện số học cuối tại máy.
-              </p>
-            )}
-            {semantic && (
-              <button
-                className="semantic-example"
-                disabled={chatInputLocked}
-                onClick={semanticSample}
-              >
-                <strong>Thử một kế hoạch chưa công bố</strong>
-                <span>Để model tự phát hiện, không nhập cụm thủ công</span>
-              </button>
-            )}
-            <div className="sample-grid">
-              {samples.map((sample) => (
-                <button
-                  key={sample.title}
-                  onClick={() => useSample(sample)}
-                  disabled={chatInputLocked}
-                  className="sample"
-                >
-                  <span className="sample-icon">{sample.icon}</span>
-                  <strong>{sample.title}</strong>
-                  <small>{sample.subtitle}</small>
-                  <span className="sample-arrow">↗</span>
-                </button>
-              ))}
-            </div>
           </div>
         ) : (
           <div className="message-list">
@@ -131,56 +83,18 @@ export function ChatPanel(props: PanelProps) {
                 <div className="message-body">
                   <div className="message-label">
                     {message.role === "user" ? "Bạn" : "Censitive"}
-                    {message.role === "assistant" && (
-                      <span>
-                        {message.provider === "local-demo" || !message.provider
-                          ? "Phản hồi mẫu"
-                          : providerName(message.provider)}{" "}
-                        · đã phục hồi local
-                      </span>
-                    )}
                   </div>
                   <div className="message-text">{message.content}</div>
-                  {message.role === "assistant" && message.metadata && (
-                    <>
-                      <small className="chat-execution">
-                        {message.metadata.local_execution === "qwen"
-                          ? `Qwen local đã thực hiện ${message.metadata.derived_count} công thức · phục hồi tại máy`
-                          : "Phục hồi tại máy · không có bước tính Qwen"}
-                      </small>
-                      {message.metadata.public_plan && (
-                        <details className="chat-plan">
-                          <summary>Xem kế hoạch công khai</summary>
-                          <pre>{message.metadata.public_plan}</pre>
-                          <p>
-                            Kiểm hợp đồng và phục hồi không chứng minh công thức
-                            hoặc số học đúng.
-                          </p>
-                        </details>
-                      )}
-                    </>
-                  )}
+                  {message.role === "assistant" &&
+                    message.metadata?.public_plan && (
+                      <details className="chat-plan">
+                        <summary>Xem câu trả lời gốc từ bên nhận</summary>
+                        <pre>{message.metadata.public_plan}</pre>
+                      </details>
+                    )}
                 </div>
               </article>
             ))}
-          </div>
-        )}
-        {phase === "sending" && provisional !== null && (
-          <div className="message-list">
-            <article
-              className="message assistant stream-provisional"
-              aria-label="Phản hồi tạm thời"
-            >
-              <div className="avatar">
-                <Shield small />
-              </div>
-              <div className="message-body">
-                <div className="message-label">
-                  Đang nhận · tạm thời, chưa xác nhận lưu
-                </div>
-                <div className="message-text">{provisional}</div>
-              </div>
-            </article>
           </div>
         )}
         {phase === "sending" && (
@@ -188,14 +102,9 @@ export function ChatPanel(props: PanelProps) {
             <span className="spinner" />{" "}
             {cancelPending
               ? "Đang hủy lượt…"
-              : cloud
-                ? `${providerName(provider)} đang xử lý; Qwen tính local nếu có công thức…`
-                : localModel
-                  ? "Qwen local đang soạn phản hồi…"
-                  : "Provider demo đang soạn phản hồi…"}
+              : `${providerName(provider)} đang trả lời; Qwen sẽ hoàn tất đáp án trên máy…`}
           </div>
         )}
-        <AuditPanel {...props} />
         <div ref={bottom} />
       </div>
       <div className="composer-area">
@@ -208,137 +117,134 @@ export function ChatPanel(props: PanelProps) {
             </button>
           </div>
         )}
-        <div className={`composer ${phase === "ready" ? "has-preview" : ""}`}>
-          <textarea
-            ref={input}
-            name="message"
-            autoComplete="off"
-            aria-label="Nội dung hội thoại"
-            onSelect={(event) =>
-              selectDraft(
-                event.currentTarget.selectionStart,
-                event.currentTarget.selectionEnd,
-              )
-            }
-            value={draft}
-            maxLength={20000}
-            disabled={chatInputLocked}
-            placeholder="Nhập nội dung cần soạn, tóm tắt hoặc trao đổi…"
-            onChange={(e) => changeDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-                e.preventDefault();
-                void prepare();
-              }
-            }}
-          />
-          {draftSelection && (
-            <div
-              className="selection-protection"
-              aria-label="Bảo vệ đoạn đã chọn"
+        {answered ? (
+          <div className="composer one-shot-done">
+            <button
+              className="primary"
+              disabled={busy}
+              onClick={() => void reset()}
             >
-              <span>
-                Đang chọn:{" "}
-                <q>
-                  {factState?.enabled
-                    ? draftSelection.quote
-                    : draftSelection.quote.trim()}
-                </q>
-              </span>
-              <p id="selection-scope">
-                {factState?.enabled
-                  ? "Đánh dấu đúng lần xuất hiện này trong bản nháp, không tạo định danh. Chỉ lưu khi gửi thành công."
-                  : "Thêm cụm khớp chính xác, phân biệt hoa thường và áp dụng cho mọi lần khớp; bỏ khoảng trắng đầu/cuối. Sau khi duyệt, bảo vệ được giữ trong phiên."}
-              </p>
-              <button
-                type="button"
-                aria-describedby="selection-scope"
-                disabled={
-                  chatInputLocked ||
-                  !session ||
-                  !providerConfirmed ||
-                  !factsConfirmed ||
-                  !identityConfirmed ||
-                  !!selectionIssue
-                }
-                onPointerDown={(event) => event.preventDefault()}
-                onClick={protectSelection}
-              >
-                Thêm vào bảo vệ
-              </button>
-              {selectionIssue && <p role="status">{selectionIssue}</p>}
-            </div>
-          )}
-          {selectionNotice && (
-            <p className="selection-notice" role="status">
-              {selectionNotice}{" "}
-              {selectionUndoAvailable && (
-                <button type="button" disabled={busy} onClick={undoSelection}>
-                  Hoàn tác
-                </button>
-              )}
-            </p>
-          )}
-          <div className="composer-toolbar">
-            <span>
-              <Shield small /> Text-only{" "}
-              <span className="char-count">
-                {draft.length.toLocaleString("vi-VN")} / 20.000
-              </span>
-            </span>
-            {phase === "preparing" ? (
-              <button
-                className="cancel-btn"
-                disabled={cancelPending}
-                onClick={() => void cancelPrepare()}
-              >
-                Hủy phân tích
-              </button>
-            ) : phase === "sending" ? (
-              <button
-                className="cancel-btn"
-                disabled={cancelPending}
-                onClick={() => void cancel()}
-              >
-                Hủy lượt
-              </button>
-            ) : phase === "ready" ? (
-              <a className="review-link" href="#privacy-panel">
-                Kiểm tra bản gửi →
-              </a>
-            ) : (
-              <button
-                className="primary"
-                disabled={
-                  !session ||
-                  !draft.trim() ||
-                  chatInputLocked ||
-                  !providerConfirmed ||
-                  !factsConfirmed ||
-                  !identityConfirmed ||
-                  recoveryStatus === "unknown_send" ||
-                  recoveryStatus === "storage_failed"
-                }
-                onClick={() => void prepare()}
-              >
-                Chuẩn bị bản gửi <span>↑</span>
-              </button>
-            )}
+              Câu hỏi mới
+            </button>
           </div>
-        </div>
-        <p className="composer-caption">
-          Ctrl + Enter để chuẩn bị <span>·</span>{" "}
-          {cloud
-            ? "Hủy sẽ dừng chờ; dữ liệu đã gửi không thể thu hồi."
-            : localModel
-              ? "Qwen trả lời trên máy từ bản bạn đã duyệt."
-              : "Demo dùng phản hồi mẫu, chưa kết nối mô hình AI."}
-        </p>
-        <p className="selection-hint">
-          Bôi chọn từ hoặc đoạn trong ô soạn thảo để thêm vào bảo vệ.
-          {semantic &&
-            " Qwen vẫn tự đề xuất che theo ngữ cảnh; thao tác chọn tay là bổ sung, không bắt buộc."}
-        </p>
+        ) : (
+          <>
+            <div
+              className={`composer ${phase === "ready" ? "has-preview" : ""}`}
+            >
+              <textarea
+                ref={input}
+                name="message"
+                autoComplete="off"
+                aria-label="Nội dung hội thoại"
+                onSelect={(event) =>
+                  selectDraft(
+                    event.currentTarget.selectionStart,
+                    event.currentTarget.selectionEnd,
+                  )
+                }
+                value={draft}
+                disabled={busy}
+                placeholder="Nhập nội dung cần soạn, tóm tắt hoặc trao đổi…"
+                onChange={(event) => changeDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (
+                    (event.ctrlKey || event.metaKey) &&
+                    event.key === "Enter"
+                  ) {
+                    event.preventDefault();
+                    void prepare();
+                  }
+                }}
+              />
+              {draftSelection && phase === "idle" && (
+                <div
+                  className="selection-protection"
+                  aria-label="Bảo vệ đoạn đã chọn"
+                >
+                  <span>
+                    Đang chọn: <q>{draftSelection.quote.trim()}</q>
+                  </span>
+                  <p id="selection-scope">
+                    Che mọi lần khớp chính xác của cụm đã chọn.
+                  </p>
+                  <button
+                    type="button"
+                    aria-describedby="selection-scope"
+                    disabled={
+                      busy || !session || !providerConfirmed || !!selectionIssue
+                    }
+                    onPointerDown={(event) => event.preventDefault()}
+                    onClick={protectSelection}
+                  >
+                    Thêm vào bảo vệ
+                  </button>
+                  {selectionIssue && <p role="status">{selectionIssue}</p>}
+                </div>
+              )}
+              {selectionNotice && phase === "idle" && (
+                <p className="selection-notice" role="status">
+                  {selectionNotice}{" "}
+                  {selectionUndoAvailable && (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={undoSelection}
+                    >
+                      Hoàn tác
+                    </button>
+                  )}
+                </p>
+              )}
+              <div className="composer-toolbar">
+                <span>
+                  <Shield small /> Văn bản{" "}
+                  <span className="char-count">
+                    {draft.length.toLocaleString("vi-VN")}
+                  </span>
+                </span>
+                {phase === "preparing" ? (
+                  <button
+                    className="cancel-btn"
+                    disabled={cancelPending}
+                    onClick={() => void cancelPrepare()}
+                  >
+                    Hủy phân tích
+                  </button>
+                ) : phase === "sending" ? (
+                  <button
+                    className="cancel-btn"
+                    disabled={cancelPending}
+                    onClick={() => void cancel()}
+                  >
+                    Hủy lượt
+                  </button>
+                ) : phase === "ready" ? null : (
+                  <button
+                    className="primary"
+                    disabled={
+                      !session || !draft.trim() || busy || !providerConfirmed
+                    }
+                    onClick={() => void prepare()}
+                  >
+                    Chuẩn bị bản gửi <span>↑</span>
+                  </button>
+                )}
+              </div>
+            </div>
+            {phase === "idle" && (
+              <>
+                <p className="composer-caption">
+                  Ctrl + Enter để chuẩn bị <span>·</span> Hủy sẽ dừng chờ; dữ
+                  liệu đã gửi không thể thu hồi.
+                </p>
+                <p className="selection-hint">
+                  Bôi chọn từ hoặc đoạn trong ô soạn thảo để thêm vào bảo vệ.
+                </p>
+              </>
+            )}
+          </>
+        )}
       </div>
     </section>
   );

@@ -24,9 +24,6 @@ export function WorkflowPanel({ status }: { status: WorkflowStatus }) {
           <strong>{status.title}</strong>
           <p>{status.detail}</p>
         </div>
-        <a href={`#${status.target}`}>
-          {status.action} <span aria-hidden="true">→</span>
-        </a>
       </div>
     </section>
   );

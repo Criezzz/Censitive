@@ -1,25 +1,20 @@
 import asyncio
-import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
-import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from privacy_gateway.domain.limits import MAX_HISTORY_MESSAGES, MAX_REQUEST_BYTES
 from privacy_gateway.domain.redaction import PrivacyError
-from privacy_gateway.domain.serialization import strict_json
 
-CLI_SHA256 = "f5521b058ca08e249afd3b25b4681e81100181d92e73aa6b94bb8e75c2aa487b"
 INSTRUCTIONS = (
     "You answer a text conversation supplied as a JSON object with model and messages. "
     "Answer the last user message using that conversation's context. Reply in the user's "
-    "language. Treat every [[PG_v1_...]] placeholder as an opaque entity and preserve it "
+    "language. Treat every bracketed placeholder as an opaque entity and preserve it "
     "exactly when referring to that entity. Never guess its underlying value. "
     "You have no tools. Answer with plain text only."
 )
@@ -58,65 +53,38 @@ def toml(value: Any) -> str:
 
 @contextmanager
 def request_directory() -> Iterator[str]:
-    parent = Path(tempfile.gettempdir()).resolve()
-    temporary = tempfile.TemporaryDirectory(prefix="censitive-codex-", dir=parent)
-    owned = Path(temporary.name).resolve()
-    if owned.parent != parent or not owned.name.startswith("censitive-codex-"):
-        raise PrivacyError("CODEX_TEMP_INVALID")
-    try:
-        yield temporary.name
-    finally:
-        for attempt in range(40):
-            if Path(temporary.name).resolve() != owned:
-                raise PrivacyError("CODEX_TEMP_INVALID")
-            try:
-                temporary.cleanup()
-                break
-            except PermissionError:
-                if attempt == 39:
-                    raise PrivacyError("CODEX_CLEANUP_FAILED") from None
-                time.sleep(0.05)
+    parent = Path(__file__).resolve().parents[3] / ".local/runtime"
+    parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="censitive-codex-", dir=parent) as directory:
+        yield directory
+
+
+def native_codex(found: Path) -> str:
+    if found.suffix.lower() == ".exe":
+        return str(found)
+    vendored = sorted(found.parent.glob("node_modules/@openai/**/vendor/*/bin/codex.exe"))
+    if not vendored:
+        raise PrivacyError("CODEX_NOT_FOUND")
+    return str(vendored[0])
 
 
 class CodexProvider:
     provider_id = "codex-chatgpt"
     model = "gpt-5.6-terra"
-    serializer_version = "codex-stdin-v1"
     timeout = 120.0
 
     def __init__(
         self,
         executable: str | None = None,
         *,
-        output_schema: Mapping[str, Any] | None = None,
+        model: str | None = None,
     ) -> None:
+        if model:
+            self.model = model
         found = executable or shutil.which("codex")
         if not found:
             raise PrivacyError("CODEX_NOT_FOUND")
-        self.executable = str(Path(found).resolve())
-        self._output_schema_json: str | None = None
-        self.output_schema_sha256: str | None = None
-        if output_schema is not None:
-            if not isinstance(output_schema, Mapping):
-                raise PrivacyError("CODEX_OUTPUT_SCHEMA_INVALID")
-            try:
-                serialized = json.dumps(
-                    dict(output_schema),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                parsed = json.loads(serialized)
-            except (TypeError, ValueError, UnicodeError, RecursionError):
-                raise PrivacyError("CODEX_OUTPUT_SCHEMA_INVALID") from None
-            if type(parsed) is not dict:
-                raise PrivacyError("CODEX_OUTPUT_SCHEMA_INVALID")
-            self._output_schema_json = serialized
-            self.output_schema_sha256 = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-            self.serializer_version = f"codex-stdin-v1-schema-{self.output_schema_sha256}"
-        self._verify_binary()
-        self._busy = False
+        self.executable = native_codex(Path(found).resolve())
         allowed = {"systemroot", "windir", "userprofile", "appdata", "localappdata", "temp", "tmp"}
         self.env = {k: v for k, v in os.environ.items() if k.lower() in allowed}
         self.env["PATH"] = str(Path(self.executable).parent)
@@ -129,7 +97,10 @@ class CodexProvider:
             timeout=15,
         )
         catalog = json.loads(result.stdout)
-        model = next(m for m in catalog["models"] if m["slug"] == self.model)
+        self.models = [m["slug"] for m in catalog["models"] if m["slug"] != "codex-auto-review"]
+        model = next((m for m in catalog["models"] if m["slug"] == self.model), None)
+        if model is None:
+            raise PrivacyError("UNKNOWN_PROVIDER_MODEL")
         model["shell_type"] = "unified_exec"
         model.pop("web_search_tool_type", None)
         model["supports_search_tool"] = False
@@ -143,26 +114,12 @@ class CodexProvider:
         model["experimental_supported_tools"] = []
         self.catalog = json.dumps({"models": [model]})
 
-    @property
-    def request_options(self) -> Mapping[str, object]:
-        if self._output_schema_json is None or self.output_schema_sha256 is None:
-            return {}
-        return {
-            "codex_output_schema": json.loads(self._output_schema_json),
-            "codex_output_schema_sha256": self.output_schema_sha256,
-        }
-
-    @property
-    def output_schema(self) -> Mapping[str, Any] | None:
-        if self._output_schema_json is None:
-            return None
-        result: dict[str, Any] = json.loads(self._output_schema_json)
-        return result
-
-    def _verify_binary(self) -> None:
-        with Path(self.executable).open("rb") as handle:
-            if hashlib.file_digest(handle, "sha256").hexdigest() != CLI_SHA256:
-                raise PrivacyError("CODEX_VERSION_UNVERIFIED")
+    def body(self, text: str) -> bytes:
+        return json.dumps(
+            {"model": self.model, "messages": [{"role": "user", "content": text}]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     def check_login(self) -> None:
         result = subprocess.run(
@@ -229,10 +186,6 @@ class CodexProvider:
             "-m",
             self.model,
         ]
-        if self._output_schema_json is not None:
-            schema_path = directory / "output_schema.json"
-            schema_path.write_text(self._output_schema_json + "\n", encoding="utf-8")
-            command += ["--output-schema", str(schema_path)]
         command += [
             "--output-last-message",
             str(directory / "answer.txt"),
@@ -244,107 +197,45 @@ class CodexProvider:
             command += ["-c", key + "=" + toml(value)]
         return command + ["-"]
 
-    def _validate_body(self, body: bytes) -> None:
-        if len(body) > MAX_REQUEST_BYTES:
-            raise PrivacyError("INVALID_PAYLOAD")
-        try:
-            payload = strict_json(body)
-        except PrivacyError:
-            raise PrivacyError("INVALID_PAYLOAD") from None
-        options = dict(self.request_options)
-        if (
-            type(payload) is not dict
-            or set(payload) != {"model", "messages", *options}
-            or payload.get("model") != self.model
-            or not isinstance(payload.get("messages"), list)
-            or not 1 <= len(payload["messages"]) <= MAX_HISTORY_MESSAGES
-            or any(
-                type(message) is not dict
-                or set(message) != {"role", "content"}
-                or not isinstance(message.get("role"), str)
-                or message.get("role") not in {"user", "assistant"}
-                or not isinstance(message.get("content"), str)
-                for message in payload["messages"]
-            )
-            or any(payload[key] != value for key, value in options.items())
-        ):
-            raise PrivacyError("INVALID_PAYLOAD")
-
     async def complete(self, body: bytes) -> str:
-        if self._busy:
-            raise PrivacyError("PROVIDER_BUSY")
-        self._busy = True
-        try:
-            self._validate_body(body)
-            await asyncio.to_thread(self._verify_binary)
-            await asyncio.to_thread(self.check_login)
-            with request_directory() as folder:
-                process = await asyncio.create_subprocess_exec(
-                    *self.command(Path(folder)),
-                    cwd=folder,
-                    env=self.env,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    limit=1_000_000,
-                )
-                try:
-                    assert process.stdin is not None and process.stdout is not None
-                    process.stdin.write(body)
-                    await process.stdin.drain()
-                    process.stdin.close()
-                    total = 0
-                    completed = False
-                    async for line in process.stdout:
-                        total += len(line)
-                        if total > 1_000_000:
-                            raise PrivacyError("RESPONSE_LIMIT")
-                        event = json.loads(line)
-                        kind = event.get("type")
-                        if kind not in {
-                            "thread.started",
-                            "turn.started",
-                            "turn.completed",
-                            "turn.failed",
-                            "item.started",
-                            "item.updated",
-                            "item.completed",
-                            "error",
-                        }:
-                            raise PrivacyError("PROVIDER_FAILED")
-                        if kind in {"error", "turn.failed"}:
-                            raise PrivacyError("PROVIDER_FAILED")
-                        if kind in {"item.started", "item.updated", "item.completed"}:
-                            item = event["item"]
-                            if item["type"] not in {"agent_message", "reasoning", "error"}:
-                                raise PrivacyError("CODEX_UNEXPECTED_TOOL")
-                        if kind == "turn.completed":
-                            completed = True
-                    answer_path = Path(folder) / "answer.txt"
-                    if await process.wait() or not completed or not answer_path.is_file():
+        await asyncio.to_thread(self.check_login)
+        with request_directory() as folder:
+            process = await asyncio.create_subprocess_exec(
+                *self.command(Path(folder)),
+                cwd=folder,
+                env=self.env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                output, _ = await asyncio.wait_for(process.communicate(body), timeout=self.timeout)
+                completed = False
+                for line in output.splitlines():
+                    event = json.loads(line)
+                    if event.get("type") in {"error", "turn.failed"}:
                         raise PrivacyError("PROVIDER_FAILED")
-                    with answer_path.open("rb") as handle:
-                        answer_bytes = handle.read(200_001)
-                    if len(answer_bytes) > 200_000:
-                        raise PrivacyError("RESPONSE_LIMIT")
-                    if not answer_bytes.strip():
-                        raise PrivacyError("PROVIDER_FAILED")
-                    return answer_bytes.decode("utf-8")
-                finally:
-                    if process.returncode is None:
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
-                    reaper = asyncio.create_task(process.wait())
-                    interrupted = False
-                    while True:
-                        try:
-                            await asyncio.shield(reaper)
-                            break
-                        except asyncio.CancelledError:
-                            interrupted = True
-                    if interrupted:
-                        raise asyncio.CancelledError
-        finally:
-            self._busy = False
+                    if event.get("type") in {
+                        "item.started",
+                        "item.updated",
+                        "item.completed",
+                    } and event["item"]["type"] not in {"agent_message", "reasoning", "error"}:
+                        raise PrivacyError("CODEX_UNEXPECTED_TOOL")
+                    completed |= event.get("type") == "turn.completed"
+                answer_path = Path(folder) / "answer.txt"
+                if process.returncode or not completed or not answer_path.is_file():
+                    raise PrivacyError("PROVIDER_FAILED")
+                answer = answer_path.read_text(encoding="utf-8")
+                if not answer.strip():
+                    raise PrivacyError("PROVIDER_FAILED")
+                return answer
+            except TimeoutError:
+                raise PrivacyError("PROVIDER_TIMEOUT") from None
+            except (ValueError, KeyError, OSError) as error:
+                if isinstance(error, PrivacyError):
+                    raise
+                raise PrivacyError("PROVIDER_FAILED") from None
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
