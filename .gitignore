@@ -1,5 +1,10 @@
 .local/
 node_modules/
+backend/privacy_gateway/web/
+src/backend/privacy_gateway/web/
+frontend/dist/
+test-results/
+.hypothesis/
 
 .venv*/
 __pycache__/
