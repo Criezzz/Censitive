@@ -28,8 +28,8 @@ Worked example: original_request and rewritten_prompt both say "Write a slogan f
 Return {"items":[{"span":"Acme Robotics","replacement":"a robotics company",
 "task_needs_exact_value":false}]}.
 Set task_needs_exact_value=true ONLY when the remote model must use public knowledge about
-that exact entity, for example "is Wadzpay legitimate?". Set it false when the value only
-needs to appear in the final text: letters, posts (including SEO locations), slogans or names
+that exact entity, for example "is Zentrix Bank regulated?". Set it false when the value only
+needs to appear in the final text: letters, posts, slogans, a name in a wedding toast or names
 in a résumé. Those values are restored locally after the remote answer.
 Use an empty items array when nothing needs generalization. /no_think"""
 LEAK_SCHEMA: dict[str, Any] = {
@@ -55,12 +55,7 @@ LEAK_SCHEMA: dict[str, Any] = {
 
 
 def leak_contract() -> tuple[str, dict[str, Any]]:
-    instruction = LEAK_INSTRUCTION.replace("is Wadzpay legitimate?", "is Zentrix Bank regulated?")
-    instruction = instruction.replace("posts (including SEO locations)", "posts")
-    instruction = instruction.replace(
-        "slogans or names", "slogans, a name in a wedding toast or names"
-    )
-    return instruction, LEAK_SCHEMA
+    return LEAK_INSTRUCTION, LEAK_SCHEMA
 
 
 def candidates(original: str, prompt: str) -> list[str]:
