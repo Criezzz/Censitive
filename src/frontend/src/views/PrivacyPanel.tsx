@@ -134,7 +134,7 @@ export function PrivacyPanel({ model: state, actions }: PanelProps) {
                 aria-pressed={inspect === "json"}
                 onClick={() => setInspect("json")}
               >
-                Body JSON
+                JSON gửi đi
               </button>
             </div>
             {inspect === "preview" ? (

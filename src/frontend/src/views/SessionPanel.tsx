@@ -4,8 +4,7 @@ import { Shield } from "./Shield";
 
 export function SessionPanel({ model, actions }: PanelProps) {
   const { session, sessions, sessionMutation, busy, providerConfirmed } = model;
-  const { reset, openSession, renameSession, deleteSession, openProviders } =
-    actions;
+  const { reset, openSession, renameSession, deleteSession } = actions;
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const locked = busy || sessionMutation?.status === "unknown";
@@ -115,13 +114,7 @@ export function SessionPanel({ model, actions }: PanelProps) {
         )}
       </div>
       {!providerConfirmed && session && (
-        <button
-          className="reselect-provider"
-          onClick={openProviders}
-          disabled={locked}
-        >
-          Chọn lại kết nối để tiếp tục
-        </button>
+        <p className="session-provider-status">Kết nối chưa xác nhận</p>
       )}
       {sessionMutation?.status === "unknown" && (
         <p className="session-recovery" role="alert">

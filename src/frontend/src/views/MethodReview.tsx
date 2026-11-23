@@ -215,8 +215,7 @@ export function MethodReview({
   return (
     <>
       <p className="review-hint">
-        Muốn che thêm: bôi đen một chữ hoặc cụm trong bản gửi dưới đây, rồi bấm
-        “Che cụm này”.
+        Bôi chọn đoạn trong bản gửi rồi bấm “Che cụm này”.
       </p>
       <pre
         ref={previewRef}

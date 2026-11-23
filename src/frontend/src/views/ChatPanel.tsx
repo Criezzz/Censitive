@@ -32,6 +32,7 @@ export function ChatPanel({ model, actions, elements }: PanelProps) {
   } = actions;
   const { bottom, input } = elements;
   const answered = messages.some((message) => message.role === "assistant");
+  const conversation = useRef<HTMLElement>(null);
   const followLatest = useRef(true);
   useEffect(() => {
     followLatest.current = true;
@@ -45,8 +46,17 @@ export function ChatPanel({ model, actions, elements }: PanelProps) {
     } else if (followLatest.current)
       container.scrollTop = container.scrollHeight;
   }, [messages, bottom]);
+  useEffect(() => {
+    if (phase === "sending" && window.matchMedia("(max-width: 900px)").matches) {
+      conversation.current?.scrollIntoView({
+        block: "start",
+        behavior: "instant",
+      });
+    }
+  }, [phase]);
   return (
     <section
+      ref={conversation}
       className="conversation"
       id="chat-panel"
       aria-label="Hội thoại"
@@ -235,8 +245,7 @@ export function ChatPanel({ model, actions, elements }: PanelProps) {
             {phase === "idle" && (
               <>
                 <p className="composer-caption">
-                  Ctrl + Enter để chuẩn bị <span>·</span> Hủy sẽ dừng chờ; dữ
-                  liệu đã gửi không thể thu hồi.
+                  Ctrl + Enter để chuẩn bị bản gửi.
                 </p>
                 <p className="selection-hint">
                   Bôi chọn từ hoặc đoạn trong ô soạn thảo để thêm vào bảo vệ.

@@ -79,16 +79,13 @@ export function ProvidersDialog(props: ProviderDialogProps) {
               </p>
             ) : (
               <>
-                <label htmlFor="auth-method">Cách kết nối</label>
-                <select
-                  id="auth-method"
-                  value="chatgpt-cli"
-                  onChange={() => {}}
-                >
-                  <option value="chatgpt-cli">
+                <p>
+                  <strong>Cách kết nối</strong>
+                  <br />
+                  <data value="chatgpt-cli">
                     Đăng nhập ChatGPT qua Codex
-                  </option>
-                </select>
+                  </data>
+                </p>
                 <p>
                   Codex quản lý đăng nhập trên trình duyệt chính thức. Censitive
                   không nhận mật khẩu hoặc API key.
@@ -187,7 +184,7 @@ export function ProvidersDialog(props: ProviderDialogProps) {
         </p>
       )}
       <div className="connection-footer">
-        <p>Đổi kết nối hoặc mô hình sẽ xóa bản duyệt hiện tại.</p>
+        <p>Đổi kết nối hoặc mô hình sẽ xóa bản duyệt nếu đang có.</p>
         <button
           className="primary"
           disabled={!chosen || working || !canSelect}
